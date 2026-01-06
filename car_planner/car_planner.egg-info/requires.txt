@@ -1,4 +1,0 @@
-numpy
-casadi
-scipy
-jax-cosmo
