@@ -23,38 +23,17 @@ from car_dynamics.controllers_torch import AltPurePursuitController, RandWalkCon
 import faulthandler
 faulthandler.enable()
 
-def log_data(dataset, env, action, controller):
-        dataset.data_logs["xpos_x"].append(env.world.pose[0])
-        dataset.data_logs["xpos_y"].append(env.world.pose[1])
-        dataset.data_logs["xpos_z"].append(env.world.pose[2])
-        #log orientation
-        dataset.data_logs["xori_w"].append(env.world.orientation[0])
-        dataset.data_logs["xori_x"].append(env.world.orientation[1])
-        dataset.data_logs["xori_y"].append(env.world.orientation[2])
-        dataset.data_logs["xori_z"].append(env.world.orientation[3])
-        #log linear velocity
-        dataset.data_logs["xvel_x"].append(env.world.lin_vel[0])
-        dataset.data_logs["xvel_y"].append(env.world.lin_vel[1])
-        dataset.data_logs["xvel_z"].append(env.world.lin_vel[2])
-        #log linear acceleration
-        dataset.data_logs["xacc_x"].append(env.world.lin_acc[0])
-        dataset.data_logs["xacc_y"].append(env.world.lin_acc[1])
-        dataset.data_logs["xacc_z"].append(env.world.lin_acc[2])
-        #log angular velocity
-        dataset.data_logs["avel_x"].append(env.world.ang_vel[0])
-        dataset.data_logs["avel_y"].append(env.world.ang_vel[1])    
+def log_data(dataset, obs):
+    dataset.data_logs["history"].append(obs['history'])
+    dataset.data_logs["static_features"].append(obs['static_features'])
+    dataset.data_logs["current_state"].append(obs['current_state'])
 
-        dataset.data_logs["avel_z"].append(env.world.ang_vel[2])
+def get_rollout_fn(use_ray):
+    if use_ray:
+        return ray.remote(rollout)
+    else:
+        return rollout
 
-        dataset.data_logs["traj_x"].append(controller.target_pos[0])
-        dataset.data_logs["traj_y"].append(controller.target_pos[1])
-
-        dataset.data_logs["lap_end"].append(0)
-
-        dataset.data_logs["throttle"].append(action[0])
-        dataset.data_logs["steer"].append(action[1])
-
-# @ray.remote
 def rollout(id, simend, render, debug_plots, datadir):
     tic = time.time()
 
@@ -106,6 +85,7 @@ def rollout(id, simend, render, debug_plots, datadir):
 
     controller = ppcontrol #all_controllers[np.random.choice([0, 1])]
     trajectory = change_track(scale, direction)
+    env.world.trajectory = trajectory
     
     # tuned kp and kd
     kp = np.random.uniform(6, 10)
@@ -131,13 +111,15 @@ def rollout(id, simend, render, debug_plots, datadir):
         else:
             raise ValueError(f"Unknown Controller: {controller.name}")
 
-        prev_action = action
+        action_matrix = np.zeros(env.action_space.shape)
+        action_matrix[:,4] = action[0]
+        action_matrix[:,5] = action[1]
         #TODO Fix this, the action is getting clipped like 25% of the time
-        action = np.clip(action, env.action_space.low, env.action_space.high)
+        action_matrix = np.clip(action_matrix, env.action_space.low, env.action_space.high)
         # actions.append(action[0]) 
-        log_data(dataset, env, action, controller)
+        obs, reward, done, info = env.step(action_matrix)
+        log_data(dataset, obs)
 
-        obs, reward, done, info = env.step(np.array(action))
 
         # check if the robot screwed up
         #TODO Fix when adding slope changes to the world.
@@ -146,7 +128,7 @@ def rollout(id, simend, render, debug_plots, datadir):
             break
     
     if not is_terminate:
-        dataset.data_logs["lap_end"][-1] = 1 
+        # dataset.data_logs["lap_end"][-1] = 1 
         now = datetime.datetime.now().isoformat(timespec='milliseconds')
         file_name = "log_" + str(id) + '_' + str(now) + ".pkl"
         filepath = os.path.join(datadir, file_name)
@@ -159,17 +141,17 @@ def rollout(id, simend, render, debug_plots, datadir):
 
         print("Saved Data to:", filepath)
 
-        if debug_plots:
-            actions = np.array(actions)
-            print(actions.shape)
-            plt.plot(actions, label = "actual command")
-            # plt.plot(actions[:, 1], label = "steering")
-            # plt.plot(ppcontrol.target_velocities, label="targetvel")
-            plt.legend()
-            plt.show()
-            plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
-            plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
-            plt.show()
+        # if debug_plots:
+        #     actions = np.array(actions)
+        #     print(actions.shape)
+        #     plt.plot(actions, label = "actual command")
+        #     # plt.plot(actions[:, 1], label = "steering")
+        #     # plt.plot(ppcontrol.target_velocities, label="targetvel")
+        #     plt.legend()
+        #     plt.show()
+        #     plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
+        #     plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
+        #     plt.show()
         
         dataset.reset_logs()
             
@@ -180,18 +162,19 @@ def rollout(id, simend, render, debug_plots, datadir):
 
 if __name__ == "__main__":
 
-    render = True
+    render = False
     debug_plots = False
     simend = 20000
-    episodes = 1
+    episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
     os.makedirs(data_dir, exist_ok=True)
 
     num_success = 0
     start = time.time()
     if render or debug_plots:
+        rollout_fn = get_rollout_fn(False)
         for i in range(episodes):
-            ret = rollout(i, simend, render, debug_plots, data_dir)
+            ret = rollout_fn(i, simend, render, debug_plots, data_dir)
             print(f"Episode {i} Complete")
             if ret:
                 num_success += 1
@@ -201,12 +184,13 @@ if __name__ == "__main__":
         print(f"Time Elapsed:, {dur}")   
     else:
         assert(render == False and debug_plots == False)
+        rollout_fn = get_rollout_fn(True)
         # Let's start Ray
         ray.init()
         ret = []
         for i in range(episodes):
-            ret.append(rollout.remote(i, simend, render, debug_plots, data_dir))
-            print(f"Episode {i} Complete")
+            ret.append(rollout_fn.remote(i, simend, render, debug_plots, data_dir))
+            print(f"Episode {i} Appended")
         output = ray.get(ret)
         # print(output)
         for ifsuccess in output:

@@ -7,6 +7,7 @@ import numpy as np
 from termcolor import colored
 from car_dynamics.envs.mujoco_sim import World
 from scipy.spatial.transform import Rotation as R
+from collections import deque
 
 class MuJoCoCar(gym.Env):
 
@@ -15,6 +16,15 @@ class MuJoCoCar(gym.Env):
         'dt': 0.02,
         'is_render': False,
         'delay': 0,
+
+        'state_dim': 13,
+        'static_dim': 9,
+        'action_dim_per_entity': 6,
+        'num_entities': 5,
+        'history_dim': 19,
+        'history_length': 100,
+
+        'wheel_configs': None
     }
 
 
@@ -26,21 +36,48 @@ class MuJoCoCar(gym.Env):
         for key, value in self.config.items():
             assert key in self.DEFAULT, f'Bad key {key}'
             setattr(self, key, value)
-    
-        
-        self.world = World({'is_render': self.is_render,})
 
-
-        # Action space: target vel and steering
-        self.action_space = spaces.Box(low=np.array([-1., -1.]), 
-                                       high=np.array([1., 1.]), dtype=np.float32)
+        if not self.wheel_configs:
+            self.wheel_configs = [
+                {"pos":"0.1385  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":"0.1385 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":"-0.158  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":"-0.158 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+            ]
+        self.num_wheels = len(self.wheel_configs)
         
-        self.observation_space = spaces.Box(
-                ## x, y, psi, vx, vy, omega
-                low=np.array([-np.inf] * 6), 
-                high=np.array([np.inf] * 6), 
-                dtype=np.float32,
+        self.world = World({'is_render': self.is_render, 'wheel_configs': self.wheel_configs})
+
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, 
+            shape=(self.num_entities, self.action_dim_per_entity), 
+            dtype=np.float32
         )
+        
+        self.observation_space = spaces.Dict({
+            # (N, self.num_entities, self.history_dim): History of dynamic states for [Root, W1, W2, W3, W4]
+            # State and Applied action at t = T-1, ..., T-N+1
+            "history": spaces.Box(
+                low=-np.inf, high=np.inf, 
+                shape=(self.history_length, self.num_entities, self.history_dim), 
+                dtype=np.float32
+            ),
+            # State of entites at t=T
+            "current_state": spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(self.num_entities, self.state_dim)
+            ),
+            # (self.num_entities, self.static_dim): Static features per entity
+            "static_features": spaces.Box(
+                low=-np.inf, high=np.inf, 
+                shape=(self.num_entities, self.static_dim), 
+                dtype=np.float32
+            )
+        })
+
+        self.history_buffer = deque(maxlen=self.history_length)
+        self.static_features = self._build_static_features()
+        self.current_state = np.zeros((self.num_entities, self.state_dim), dtype=np.float32)
 
         self._step = None
         
@@ -54,27 +91,73 @@ class MuJoCoCar(gym.Env):
 
         self.reset()
 
-
-    def obs_state(self):
-        """Return the 2D state of the car [x, y, psi, vx, vy, omega]
-
-        Returns:
-            np.array: [x, y, psi, vx, vy, omega]
+    def _build_static_features(self):
         """
+        build static features for each entity.
+        """
+        features = np.zeros((self.num_entities, self.static_dim), dtype=np.float32)
         
-        quat = self.world.orientation
-        r = R.from_quat([quat[1], quat[2], quat[3], quat[0]])
-        yaw = r.as_euler('zyx')[0]
+        for i, config in enumerate(self.wheel_configs):
+            idx = i + 1
+            features[idx, :6] = config["mask"]
+            features[idx, 6] = config["radius"]
+            features[idx, 7] = config["width"]
+            features[idx, 8] = config["mass"]
+
+        return features
+
+    def obs_state(self):        
+        history = np.array(self.history_buffer, dtype=np.float32)
         
-        return np.array([
-            self.world.pose[0],
-            self.world.pose[1],
-            yaw,
-            self.world.lin_vel[0],
-            self.world.lin_vel[1],
-            self.world.ang_vel[2],
-        ])
+        return {
+            "history": history,
+            "current_state": self.current_state,
+            "static_features": self.static_features
+        }
     
+    def _record_history(self, action=None):
+        """
+        Append (self.num_entities, self.history_dim) shaped state matrix for all entities to history buffer
+        Row 0: Root State (World Frame)
+        Row 1~4: Wheel States (Root Relative Frame)
+        Each Col: 7 (Pose) + 6 (Twist) + 6 (Action) at t
+        
+        **Caution 1** This function should be called before action is applied
+        **Caution 2** history[t][pose, twist] are not a result of history[t][action]
+        """
+        if action is None:
+            action = np.zeros((self.num_entities, self.action_dim_per_entity), dtype=np.float32)
+        
+        state_matrix = self._get_current_state()
+        history_matrix = np.concatenate((state_matrix, action), axis=1)
+
+        self.history_buffer.append(history_matrix)
+
+    def _get_current_state(self):
+        state_matrix = np.zeros((self.num_entities, self.state_dim), dtype=np.float32)
+
+        root_pos = self.world.pose
+        root_quat = self.world.orientation
+        root_lin_vel = self.world.lin_vel
+        root_ang_vel = self.world.ang_vel
+        
+        state_matrix[0, 0:3] = root_pos
+        state_matrix[0, 3:7] = root_quat
+        state_matrix[0, 7:10] = root_lin_vel
+        state_matrix[0, 10:13] = root_ang_vel
+
+        for i in range(self.num_wheels):
+            wheel_pos = self.world.wheel_pos(i)
+            wheel_quat = self.world.wheel_quat(i)
+            wheel_lin_vel = self.world.wheel_lin_vel(i)
+            wheel_ang_vel = self.world.wheel_ang_vel(i)
+
+            state_matrix[i+1, 0:3] = wheel_pos
+            state_matrix[i+1, 3:7] = wheel_quat
+            state_matrix[i+1, 7:10] = wheel_lin_vel
+            state_matrix[i+1, 10:13] = wheel_ang_vel
+        
+        return state_matrix
 
     def reset(self):
         self._step = 0.
@@ -85,7 +168,13 @@ class MuJoCoCar(gym.Env):
         self.action_buffer = []
         for _ in range(self.delay):
             self.action_buffer.append(np.array([0., 0.], dtype=np.float32))
-            
+        
+        self.history_buffer.clear()
+        self.current_state = self._get_current_state()
+
+        for _ in range(self.history_length):
+            self._record_history()
+
         return self.obs_state()
 
     def reward(self,):
@@ -102,15 +191,18 @@ class MuJoCoCar(gym.Env):
         num_steps = int(self.dt / self.world.dt)
 
         # scale acceleration command 
-        throttle = action[0] * self.world.max_throttle #scale it to real values
-        steer = action[1] * self.world.max_steer  + self.world.steer_bias # scale it to real values
+        throttle = action[:, 4] * self.world.max_throttle #scale it to real values
+        steer = action[:, 5] * self.world.max_steer  + self.world.steer_bias # scale it to real values
         for _ in range(num_steps):
             #calculate the target vel from throttle and previous velocity.
             self.target_velocity = throttle * self.world.dt + self.target_velocity
-            action[0] = self.target_velocity
-            action[1] = steer
+            action[:, 4] = self.target_velocity
+            action[:, 5] = steer
+            action[3:5, 5] *= -1
 
+            self._record_history(action)
             self.world.step(action)
+            self.current_state = self._get_current_state()
 
         reward = self.reward()
 
