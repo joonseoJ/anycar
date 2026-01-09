@@ -21,5 +21,6 @@ setup(
         'transformers',
         'pytorch-warmup',
         'orbax-checkpoint==0.5.15',
+        'tensorboard'
     ],
 )

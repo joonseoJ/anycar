@@ -76,12 +76,12 @@ def rollout_fn_select(model_struct, model, dt, L, LR):
     
 def rollout_fn_jax(model):  
     # @jax.jit
-    def rollout_fn_tansformer_jax(key, obs_history, state, action, dynamic_params_tuple, debug=False):
-        assert state.shape[1] == 6
-        assert action.shape[2] == 2
+    def rollout_fn_tansformer_jax(key, obs_history, state, action, static_features, debug=False):
+        # assert state.shape[1] == 6
+        # assert action.shape[2] == 2
         
-        next_state = model.step(key, obs_history, state, action)
-        next_state = jnp.swapaxes(next_state, 0, 1)
+        next_state = model.step(key, obs_history, state, action, static_features) #(N, T_future, E, X)
+        next_state = jnp.swapaxes(next_state, 0, 1) #(T_future, N, E, X)
         
         return next_state, {}
     

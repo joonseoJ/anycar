@@ -22,4 +22,4 @@ class CarDataset:
         } 
         
     def __len__(self):
-        return len(self.data_logs["xpos_x"])
+        return len(self.data_logs["history"])

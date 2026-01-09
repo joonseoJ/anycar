@@ -14,14 +14,25 @@ from tqdm import tqdm
 from car_dynamics.envs.mujoco_sim.cam_utils import *
 from car_dataset import CarDataset
 from car_planner.track_generation import change_track
+from car_planner.global_trajectory import GlobalTrajectory
 # from car_planner.track_generation_realistic import change_track
 from car_dynamics import MUJOCO_MODEL_DIR
 
 from car_dynamics.envs.mujoco_sim.car_mujoco import MuJoCoCar
 from car_dynamics.controllers_torch import AltPurePursuitController, RandWalkController
+from car_dynamics.controllers_jax import MPPIController, rollout_fn_jax, MPPIRunningParams
+from car_dynamics.models_jax import DynamicsJax
+from car_foundation import CAR_FOUNDATION_MODEL_DIR
+
+from car_ros2.utils import load_mppi_params, load_dynamic_params
+
+import jax
 
 import faulthandler
 faulthandler.enable()
+
+def empty_fn():
+    ...
 
 def log_data(dataset, obs):
     dataset.data_logs["history"].append(obs['history'])
@@ -34,7 +45,7 @@ def get_rollout_fn(use_ray):
     else:
         return rollout
 
-def rollout(id, simend, render, debug_plots, datadir):
+def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_i):
     tic = time.time()
 
     dataset = CarDataset()
@@ -59,13 +70,6 @@ def rollout(id, simend, render, debug_plots, datadir):
     dataset.car_params["max_steer"] = env.generate_new_max_steering()
     # generate new steering bias
     dataset.car_params["steer_bias"] = env.generate_new_steering_bias()
-
-    # fine tuning data collection
-    # dataset.car_params['mass'] = 3.794
-    # dataset.car_params['friction'] = 1.
-    # dataset.car_params['max_throttle'] = 10.
-    # dataset.car_params['delay'] = 4
-
     print("Car Params", dataset.car_params)
 
     #choose to change parameters or not
@@ -73,19 +77,22 @@ def rollout(id, simend, render, debug_plots, datadir):
 
     direction = np.random.choice([-1, 1])
     scale = int(np.random.uniform(1, 5))
-
-    #wenli where did you get the lower vel from?
-    ppcontrol = AltPurePursuitController({
-        'wheelbase': dataset.car_params["wheelbase"], 
-        'totaltime': simend,
-        'lowervel': 0.7, #actual min vel
-        'uppervel': 2., #actual max vel   
-        'max_steering': env.world.max_steer    
-    })
-
-    controller = ppcontrol #all_controllers[np.random.choice([0, 1])]
     trajectory = change_track(scale, direction)
+    global_planner = GlobalTrajectory(trajectory)
     env.world.trajectory = trajectory
+
+    # MPPI Controller setting
+    model_params = load_dynamic_params()
+    mppi_running_params = mppi.get_init_params()
+    key_i, key2 = jax.random.split(key_i)
+    mppi_running_params = MPPIRunningParams(
+        a_mean = mppi_running_params.a_mean,
+        a_cov = mppi_running_params.a_cov,
+        prev_a = mppi_running_params.prev_a,
+        state_hist = mppi_running_params.state_hist,
+        key = key2,
+    )
+    
     
     # tuned kp and kd
     kp = np.random.uniform(6, 10)
@@ -95,31 +102,25 @@ def rollout(id, simend, render, debug_plots, datadir):
     is_terminate = False 
     clipped = 0
     actions = []
+    history_length = env.observation_space['history'].shape[0]
     for t in tqdm(range(simend)):
+        state = env.obs_state()
+        
+        if t == 0:
+            for _ in range(history_length):
+                mppi_running_params = mppi.feed_hist(mppi_running_params, state, np.array([0., 0.]))
 
-        action = controller.get_control(t, env.world, trajectory)
-        if controller.name == "pure_pursuit":
+        target_pos_arr, frenet_pose = global_planner.generate(state[:5], env.sim.params.DT, (mppi_params.h_knot - 1) * mppi_params.num_intermediate + 2 + mppi_params.delay, True)
+        target_pos_list = np.array(target_pos_arr)
+        target_pos_tensor = jnp.array(target_pos_arr)
+        dynamic_params_tuple = (model_params.LF, model_params.LR, model_params.MASS, model_params.DT, model_params.K_RFY, model_params.K_FFY, model_params.Iz, model_params.Ta, model_params.Tb, model_params.Sa, model_params.Sb, model_params.mu, model_params.Cf, model_params.Cr, model_params.Bf, model_params.Br, model_params.hcom, model_params.fr)
+        
+        action, mppi_running_params, mppi_info = mppi(state,target_pos_tensor, mppi_running_params, dynamic_params_tuple, vis_optim_traj=True,)
+        mppi_running_params = mppi.feed_hist(mppi_running_params, state, action)
+        
+        obs, reward, done, info = env.step(np.array(action))
 
-            target_vel = action[0]
-
-            action[0] = kp * (target_vel - env.world.lin_vel[0]) + kd * ((target_vel - env.world.lin_vel[0]) - last_err_vel)
-
-            action[0] /= env.world.max_throttle # normalize to -1, 1
-            
-            # print(action[0])
-            last_err_vel = target_vel - env.world.lin_vel[0]
-        else:
-            raise ValueError(f"Unknown Controller: {controller.name}")
-
-        action_matrix = np.zeros(env.action_space.shape)
-        action_matrix[:,4] = action[0]
-        action_matrix[:,5] = action[1]
-        #TODO Fix this, the action is getting clipped like 25% of the time
-        action_matrix = np.clip(action_matrix, env.action_space.low, env.action_space.high)
-        # actions.append(action[0]) 
-        obs, reward, done, info = env.step(action_matrix)
         log_data(dataset, obs)
-
 
         # check if the robot screwed up
         #TODO Fix when adding slope changes to the world.
@@ -161,20 +162,32 @@ def rollout(id, simend, render, debug_plots, datadir):
     return not is_terminate
 
 if __name__ == "__main__":
-
+    jax_key = jax.random.PRNGKey(0)
     render = False
     debug_plots = False
     simend = 20000
     episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
+    resume_model_name = "2026-01-07T14:11:07.903-jax_model_checkpoint"
+    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name, "checkpoint_0")
     os.makedirs(data_dir, exist_ok=True)
+
+    mppi_params = load_mppi_params()
+    model_params = load_dynamic_params()
+    jax_key, key2 = jax.random.split(jax_key)
+    dynamics = DynamicsJax({'model_path': resume_model_folder_path})
+    mppi_rollout_fn = rollout_fn_jax(dynamics)
+    mppi = MPPIController(
+        mppi_params, mppi_rollout_fn, empty_fn, key2
+    )
 
     num_success = 0
     start = time.time()
     if render or debug_plots:
         rollout_fn = get_rollout_fn(False)
         for i in range(episodes):
-            ret = rollout_fn(i, simend, render, debug_plots, data_dir)
+            jax_key, key2 = jax.random.split(jax_key)
+            ret = rollout_fn(i, simend, render, debug_plots, data_dir, mppi, key2)
             print(f"Episode {i} Complete")
             if ret:
                 num_success += 1
@@ -189,7 +202,8 @@ if __name__ == "__main__":
         ray.init()
         ret = []
         for i in range(episodes):
-            ret.append(rollout_fn.remote(i, simend, render, debug_plots, data_dir))
+            jax_key, key2 = jax.random.split(jax_key)
+            ret.append(rollout_fn.remote(i, simend, render, debug_plots, data_dir, mppi, key2))
             print(f"Episode {i} Appended")
         output = ray.get(ret)
         # print(output)

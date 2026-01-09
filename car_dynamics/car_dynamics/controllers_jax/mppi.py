@@ -9,6 +9,7 @@ from functools import partial
 from car_dynamics.models_jax import DynamicParams   
 import flax
 from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
+from car_dynamics.controllers_jax.utils import quat_to_yaw
 
 @dataclass
 class MPPIParams:
@@ -30,6 +31,7 @@ class MPPIParams:
     fix_history: bool
     num_obs: int
     num_actions: int
+    num_entities: int
     num_intermediate: int
     spline_order: int
     smooth_alpha: float = 0.8
@@ -38,9 +40,9 @@ class MPPIParams:
 
 @flax.struct.dataclass
 class MPPIRunningParams:
-    a_mean: jnp.ndarray
-    a_cov: jnp.ndarray  
-    prev_a: jnp.ndarray
+    a_mean_flattened: jnp.ndarray
+    a_cov_flattened: jnp.ndarray  
+    prev_a_flattened: jnp.ndarray
     state_hist: jnp.ndarray
     key: jax.random.PRNGKey
 
@@ -78,24 +80,26 @@ class MPPIController(BaseController):
     def _init_buffers(self, ):
         self.spline_order = self.params.spline_order
         self.H = (self.params.h_knot -1 ) * self.params.num_intermediate + 1 
-        self.a_mean = jnp.zeros((self.H, self.params.num_actions))
-        sigmas = jnp.array([self.params.sigma] * 2)
-        a_cov_per_step = jnp.diag(sigmas ** 2)
-        self.a_cov = jnp.tile(a_cov_per_step[None, :, :], (self.H, 1, 1))
-        self.a_mean_init = self.a_mean[-1:]
-        self.a_cov_init = self.a_cov[-1:]
+        
+        flattened_action_dim = self.params.num_entities * self.params.num_actions
+        self.a_mean_flattened = jnp.zeros((self.H, flattened_action_dim))
+        sigmas_flatten = jnp.ones((flattened_action_dim,)) * self.params.sigma
+        a_cov_flatten_per_step = jnp.diag(sigmas_flatten ** 2)
+        self.a_cov_flatten = jnp.tile(a_cov_flatten_per_step[None, :, :], (self.H, 1, 1))
+        self.a_mean_init = self.a_mean_flattened[-1:]
+        self.a_cov_flatten_init = self.a_cov_flatten[-1:]
         
         self.step_us = jnp.arange(self.H)
         self.step_nodes = jnp.arange(self.params.h_knot) * (self.params.num_intermediate)
-        self.prev_a = jnp.zeros((self.params.delay, self.params.num_actions))
+        self.prev_a_flattened = jnp.zeros((self.params.delay, flattened_action_dim))
         # self.step_count = 0
         
         state_hist_len = max(self.params.len_history, 1)
-        self.state_hist_init = jnp.zeros((state_hist_len, self.params.num_obs + self.params.num_actions))
+        self.state_hist_init = jnp.zeros((state_hist_len, self.params.num_entities ,self.params.num_obs + self.params.num_actions))
         
-        self.action_sampled = jnp.zeros((self.params.n_rollouts, self.H, self.params.num_actions))
-        self.action_init_buf = jnp.zeros((self.params.n_rollouts, self.H + self.params.delay, self.params.num_actions))
-        self.state_init_buf = jnp.ones((self.params.num_obs,))
+        self.action_sampled_flattened = jnp.zeros((self.params.n_rollouts, self.H, flattened_action_dim))
+        self.flattened_action_init_buf = jnp.zeros((self.params.n_rollouts, self.H + self.params.delay, flattened_action_dim))
+        self.state_init_buf = jnp.ones((self.params.num_entities, self.params.num_obs))
         self.x_all = []
         self.y_all = []
         
@@ -116,9 +120,9 @@ class MPPIController(BaseController):
     
     def get_init_params(self, ):
         return MPPIRunningParams(
-            a_mean = self.a_mean,
-            a_cov = self.a_cov,
-            prev_a = self.prev_a,
+            a_mean_flattened = self.a_mean_flattened,
+            a_cov_flattened = self.a_cov_flatten,
+            prev_a_flattened = self.prev_a_flattened,
             key = jax.random.PRNGKey(123),
             state_hist = self.state_hist_init,
         )
@@ -155,13 +159,15 @@ class MPPIController(BaseController):
     
     # @partial(jax.jit, static_argnums=(0,))
     def scan_seq_jax(self, key, rollout_fn, init, action_list):
-        state, obs_history, dynamic_params_tuple  = init
-        obs_history = obs_history.at[-1, :self.params.n_rollouts, :self.params.num_obs].set(state[:, :self.params.num_obs])
-        obs_history = obs_history.at[-1, :self.params.n_rollouts, -self.params.num_actions:].set(action_list[0])
-        obs_history = jnp.swapaxes(obs_history, 0, 1)
-        action_list = jnp.swapaxes(action_list, 0, 1)
+        # state (N_rollout, E, X)
+        # obs_history (N_rollout, T, E, H)
+        # static_features (N_rollout, E, S)
+        # action_list (N_rollout, T_future, E, A)
+        state, obs_history, static_features  = init
+        # obs_history = jnp.swapaxes(obs_history, 0, 1)
+        # action_list = jnp.swapaxes(action_list, 0, 1)
         key, key2 = jax.random.split(key, 2)
-        state_list, debug_info = self.rollout_fn(key2, obs_history, state, action_list, dynamic_params_tuple, self.params.debug)
+        state_list, debug_info = self.rollout_fn(key2, obs_history, state, action_list, static_features, self.params.debug)
         return debug_info, state_list
     
     @partial(jax.jit, static_argnums=(0,))
@@ -198,7 +204,15 @@ class MPPIController(BaseController):
         return state_list_jnp
     
     
-    def _get_rollout_nn(self, key, state_init, state_hist, actions, dynamic_params_tuple, fix_history=False):
+    def _get_rollout_nn(
+            self, 
+            key: jax.random.PRNGKey, 
+            state_init: jnp.ndarray, 
+            state_hist: jnp.ndarray, 
+            actions: jnp.ndarray, 
+            static_features: jnp.ndarray, 
+            fix_history=False
+        ):
         """
         Get rollout for neural network-based dynamics model.
 
@@ -207,25 +221,38 @@ class MPPIController(BaseController):
 
         Args:
             key (jax.random.PRNGKey): Random key for JAX operations.
-            state_init (jnp.ndarray): Initial state.
-            state_hist (jnp.ndarray): History of previous states.
-            actions (jnp.ndarray): Sampled actions for rollouts.
-            dynamic_params_tuple (tuple): Parameters for the dynamics model.
+            state_init (jnp.ndarray): Initial state. (E, X)
+            state_hist (jnp.ndarray): History of previous states. (T, E, H)
+            actions (jnp.ndarray): Sampled actions for rollouts. (N_rollout, T_future, E, A)
+            static_features (jnp.ndarray): Parameters for the dynamics model. (E, S)
             fix_history (bool, optional): Whether to fix the history. Defaults to False.
 
         Returns:
             jnp.ndarray: Array of states for all timesteps in the rollout.
         """
-        n_rollouts = actions.shape[0]
-        state = jnp.tile(jnp.expand_dims(state_init, 0), (n_rollouts, 1))
-        state_list = state[None]
-        obs_history = jnp.tile(jnp.expand_dims(state_hist.copy(), 0), (n_rollouts, 1, 1))
-        self.rollout_start_fn()
-        obs_history = jnp.swapaxes(obs_history, 0, 1)
-        actions = jnp.swapaxes(actions, 0, 1)
-        _, state_list2 = self.scan_fn(key, self._rollout_jit, (state, obs_history, dynamic_params_tuple), actions)
+        n_rollouts = actions.shape[0] # N
+        n_steps = actions.shape[1]    # Horizon Length
+
+        # 1. Tile Initial State
+        # state_init: (E, X) -> (N, E, X)
+        state = jnp.tile(jnp.expand_dims(state_init, 0), (n_rollouts, 1, 1))
+
+        # 2. Tile History
+        # state_hist: (T, E, H) -> (N, T, E, H)
+        obs_history = jnp.tile(jnp.expand_dims(state_hist, 0), (n_rollouts, 1, 1, 1))
+
+        # 3. Tile Static Features
+        # static_features: (E, S) -> (N, E, S)
+        static_features_tiled = jnp.tile(jnp.expand_dims(static_features, 0), (n_rollouts, 1, 1))
+
+        #4. Run static_features_tiled
+        # state_list2: (T_future, N, E, X)
+        _, state_list2 = self.scan_fn(key, self._rollout_jit, (state, obs_history, static_features_tiled), actions)
+
+        state_list = state[None] #(1, N, E, X)
         state_list = jnp.concatenate((state_list, state_list2), axis=0)
         state_list_jnp = jnp.array(state_list)
+
         return state_list_jnp
     
 
@@ -245,15 +272,19 @@ class MPPIController(BaseController):
         step, prev_action = carry
         state_step, action_step, goal = pair
 
-        dist_pos = jnp.linalg.norm(state_step[:, :2] - goal[:2], axis=1)
-        diff_psi = state_step[:, 2] - goal[2]
+        dist_pos = jnp.linalg.norm(state_step[:, 0, :2] - goal[:2], axis=1)
+        
+        curr_psi = jax.vmap(quat_to_yaw)(state_step[:, 0, 3:7])
+        diff_psi = curr_psi - goal[2]
         diff_psi = jnp.arctan2(jnp.sin(diff_psi), jnp.cos(diff_psi))
-        diff_vel = state_step[:, 3] - goal[3]
+        diff_vel = state_step[:, 0, 7] - goal[3]
+
+        diff_throttle = jnp.linalg.norm(action_step[:, 1:, 4] - prev_action[:, 1:, 4], axis=1)
         
         reward_pos_err = -dist_pos ** 2
         reward_psi = -diff_psi ** 2
         reward_vel = -diff_vel ** 2
-        reward_throttle = - (action_step[:, 0] - prev_action[:, 0]) ** 2
+        reward_throttle = - diff_throttle ** 2
         reward = reward_pos_err * 5.0 + reward_psi * 5.0 + reward_vel * 1. + reward_throttle * 0.0
         reward *= (self.params.discount ** step)
         return (step + 1, action_step), reward
@@ -265,7 +296,7 @@ class MPPIController(BaseController):
 
         Args:
             state (jnp.ndarray): State trajectory for all rollouts.
-            action (jnp.ndarray): Action trajectory for all rollouts.
+            action (jnp.ndarray): Action trajectory for all rollouts. (N_rollout, T_future, E, A)
             goal_list (jnp.ndarray): List of goal states for each timestep.
 
         Returns:
@@ -290,17 +321,20 @@ class MPPIController(BaseController):
         Returns:
             MPPIRunningParams: Updated MPPI running parameters with new state history.
         """
-        state = jnp.array(obs[:self.params.num_obs])
-        action_tensor = jnp.array(action[:self.params.num_actions])
+        state = obs
+        
+        # (E, X) + (E, A) -> (E, H)
+        current_step_feature = jnp.concatenate([state, action], axis=-1)
+
+        # (T, E, H)
         state_hist = param.state_hist
-        state_hist = state_hist.at[-1, :self.params.num_obs].set(state)
-        state_hist = state_hist.at[-1, self.params.num_obs:self.params.num_obs + self.params.num_actions].set(action_tensor)
-        state_hist = state_hist.at[:-1].set(state_hist[1:])
+        state_hist = jnp.roll(state_hist, shift=-1, axis=0)
+        state_hist = state_hist.at[-1, :, :].set(current_step_feature)
         
         return MPPIRunningParams(
-            a_mean = param.a_mean,
-            a_cov = param.a_cov,
-            prev_a = param.prev_a,
+            a_mean_flattened = param.a_mean_flattened,
+            a_cov_flattened = param.a_cov_flattened,
+            prev_a_flattened = param.prev_a_flattened,
             state_hist = state_hist,
             key = param.key,
         )
@@ -325,7 +359,12 @@ class MPPIController(BaseController):
             jnp.ndarray: Optimized state trajectory resulting from the rollout.
         """
         state_init = jnp.array(obs)
-        action_expand = jnp.tile(jnp.expand_dims(a_list, 0), (self.params.n_rollouts, 1, 1))
+        action_expand_flattened = jnp.tile(jnp.expand_dims(a_list, 0), (self.params.n_rollouts, 1, 1))
+        action_expand = action_expand_flattened.reshape(
+            *action_expand_flattened.shape[:2], 
+            self.params.num_entities, 
+            self.params.num_actions
+        )
         key, key2 = jax.random.split(key, 2)
         optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, dynamic_params_tuple, self.params.fix_history))[:, 0]
         return optim_traj
@@ -338,7 +377,7 @@ class MPPIController(BaseController):
         obs,
         goal_list, 
         running_params: MPPIRunningParams,
-        dynamic_params_tuple,
+        static_features,
     ):
         """
         Execute the Model Predictive Path Integral (MPPI) control algorithm.
@@ -353,7 +392,7 @@ class MPPIController(BaseController):
             obs (jnp.ndarray): Current observation of the system state.
             goal_list (List[jnp.ndarray]): List of goal states for the trajectory.
             running_params (MPPIRunningParams): Current MPPI running parameters.
-            dynamic_params_tuple (Tuple): Parameters for the dynamics model.
+            static_features (jnp.ndarray): Parameters for the dynamics model.
             vis_optim_traj (bool, optional): Flag to visualize the optimized trajectory. Defaults to False.
             vis_all_traj (bool, optional): Flag to visualize all sampled trajectories. Defaults to False.
 
@@ -374,29 +413,37 @@ class MPPIController(BaseController):
                 lambda key, mean, cov: jax.random.multivariate_normal(key, mean, cov)
             )(keys, traj_mean, traj_cov)
 
-        a_mean_waypoint = running_params.a_mean[::self.params.num_intermediate]
+        a_mean_waypoint = running_params.a_mean_flattened[::self.params.num_intermediate]
         
         ## Spline interpolation
-        a_mean_waypoint = a_mean_waypoint.at[:, 0].set(self.u2node(running_params.a_mean[:, 0]))
-        a_mean_waypoint = a_mean_waypoint.at[:, 1].set(self.u2node(running_params.a_mean[:, 1]))
+        for d in range(running_params.a_mean_flattened.shape[1]):
+            a_mean_waypoint = a_mean_waypoint.at[:, d].set(
+                self.u2node(running_params.a_mean_flattened[:, d])
+            )
+        # a_mean_waypoint = a_mean_waypoint.at[:, 0].set(self.u2node(running_params.a_mean[:, 0]))
+        # a_mean_waypoint = a_mean_waypoint.at[:, 1].set(self.u2node(running_params.a_mean[:, 1]))
         
         
-        a_cov_waypoint = running_params.a_cov[::self.params.num_intermediate]
+        a_cov_waypoint = running_params.a_cov_flattened[::self.params.num_intermediate]
         
         a_sampled_waypoint = jax.vmap(single_sample, in_axes=(0, None, None))( # (N, h_knot, action_dim)
             key_use, a_mean_waypoint, a_cov_waypoint,
         )
     
         ### Spline interpolation
-        a_sampled = self.action_sampled.copy()
-        a_sampled = a_sampled.at[:, :, 0].set(self.node2u_vmap(a_sampled_waypoint[:, :, 0]))
-        a_sampled = a_sampled.at[:, :, 1].set(self.node2u_vmap(a_sampled_waypoint[:, :, 1]))
+        a_sampled_flattened = self.action_sampled_flattened.copy()
+        for d in range(a_sampled_waypoint.shape[2]):
+            a_sampled_flattened = a_sampled_flattened.at[:, :, d].set(
+                self.node2u_vmap(a_sampled_waypoint[:, :, d])
+            )
+        # a_sampled = a_sampled.at[:, :, 0].set(self.node2u_vmap(a_sampled_waypoint[:, :, 0]))
+        # a_sampled = a_sampled.at[:, :, 1].set(self.node2u_vmap(a_sampled_waypoint[:, :, 1]))
         
 
-        a_sampled_raw = self.normalize_action(a_sampled)
-        a_sampled = self.action_init_buf.copy()
-        a_sampled.at[:, :self.params.delay, :].set(running_params.prev_a)
-        a_sampled = a_sampled.at[:, self.params.delay:, :].set(a_sampled_raw)
+        a_sampled_raw = self.normalize_action(a_sampled_flattened)
+        a_sampled_flattened = self.flattened_action_init_buf.copy()
+        a_sampled_flattened.at[:, :self.params.delay, :].set(running_params.prev_a_flattened)
+        a_sampled_flattened = a_sampled_flattened.at[:, self.params.delay:, :].set(a_sampled_raw)
         
         state_init = self.state_init_buf.copy()
         for i_ in range(self.params.num_obs):
@@ -404,8 +451,8 @@ class MPPIController(BaseController):
         
         ## Note: 2. Simulating rollouts using the dynamics model
         self_key, key2 = jax.random.split(self_key, 2)
-        state_list = self._get_rollout(key2, state_init, running_params.state_hist, a_sampled, dynamic_params_tuple, self.params.fix_history)   # List
-        
+        a_sampled = a_sampled_flattened.reshape(*a_sampled_flattened.shape[:2], self.params.num_entities, self.params.num_actions)
+        state_list = self._get_rollout(key2, state_init, running_params.state_hist, a_sampled, static_features, self.params.fix_history)   # List
 
         reward_rollout = self.get_reward(state_list, a_sampled, goal_list)
         cost_rollout = -reward_rollout
@@ -413,42 +460,47 @@ class MPPIController(BaseController):
         weight = cost_exp / cost_exp.sum()
 
 
-        a_sampled = a_sampled[:, self.params.delay:, :]
+        a_sampled_flattened = a_sampled_flattened[:, self.params.delay:, :]
         
         ## Note: 3. Evaluating costs for each trajectory
-        a_mean = jnp.sum(
-            weight[:, None, None] * a_sampled, axis=0
-        ) * self.params.gamma_mean + running_params.a_mean * (
+        a_mean_flattened = jnp.sum(
+            weight[:, None, None] * a_sampled_flattened, axis=0
+        ) * self.params.gamma_mean + running_params.a_mean_flattened * (
             1 - self.params.gamma_mean
         )
 
         a_cov = jnp.sum(
-                        weight[:, None, None, None] * ((a_sampled - a_mean)[..., None] * (a_sampled - a_mean)[:, :, None, :]),
+                        weight[:, None, None, None] * ((a_sampled_flattened - a_mean_flattened)[..., None] * (a_sampled_flattened - a_mean_flattened)[:, :, None, :]),
                         axis=0,
-                    ) * self.params.gamma_sigma + running_params.a_cov * (1 - self.params.gamma_sigma)
+                    ) * self.params.gamma_sigma + running_params.a_cov_flattened * (1 - self.params.gamma_sigma)
         
-        u = a_mean[0]
+        u = a_mean_flattened[0]
 
         optim_traj = None
-        action_expand = jnp.tile(jnp.expand_dims(a_mean, 0), (self.params.n_rollouts, 1, 1))
+        action_expand_flattened = jnp.tile(jnp.expand_dims(a_mean_flattened, 0), (self.params.n_rollouts, 1, 1))
+        action_expand = action_expand_flattened.reshape(
+            *action_expand_flattened.shape[:2], 
+            self.params.num_entities, 
+            self.params.num_actions
+        )
         
         self_key, key2 = jax.random.split(self_key, 2)
-        optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, dynamic_params_tuple, self.params.fix_history))[:, 0]
+        optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, static_features, self.params.fix_history))[:, 0]
         
-        prev_a = jnp.concatenate([running_params.prev_a[1:], a_mean[:1]], axis=0)         
+        prev_a_flattened = jnp.concatenate([running_params.prev_a_flattened[1:], a_mean_flattened[:1]], axis=0)         
 
         new_running_params = MPPIRunningParams(
-            a_mean = jnp.concatenate([a_mean[1:], a_mean[-1:]], axis=0),
-            a_cov = jnp.concatenate([a_cov[1:], a_cov[-1:]], axis=0),
+            a_mean_flattened = jnp.concatenate([a_mean_flattened[1:], a_mean_flattened[-1:]], axis=0),
+            a_cov_flattened = jnp.concatenate([a_cov[1:], a_cov[-1:]], axis=0),
             state_hist = running_params.state_hist,
-            prev_a = prev_a,
+            prev_a_flattened = prev_a_flattened,
             key = self_key,
         )
 
         info_dict = {
             'trajectory': optim_traj, 
             'action': None, 
-            'a_mean_jnp': a_mean,
+            'a_mean_jnp': a_mean_flattened,
             'action_candidate': None, 'x_all': None, 'y_all': None,
             
             ### Note: Need to comment out the @jax.jit decorator for the following two lines to visualize the history
@@ -456,4 +508,4 @@ class MPPIController(BaseController):
             #  'all_traj': state_list[:, best_100_idx],
         } 
         
-        return u,  new_running_params,  info_dict
+        return u.reshape(self.params.num_entities, self.params.num_actions),  new_running_params,  info_dict

@@ -4,12 +4,17 @@ import jax
 import jax.numpy as jnp
 import time
 import orbax
+import optax
 import numpy as np
 from car_foundation import CAR_FOUNDATION_MODEL_DIR
-from car_foundation.jax_models import JaxTransformerDecoder
+from car_foundation.jax_models import JaxDynamicsPredictor
 from termcolor import colored
-from flax.training import orbax_utils
+from flax.training import orbax_utils, train_state
 from functools import partial
+import torch
+
+from car_foundation.torch_models import DynamicsPredictor
+from car_dynamics.envs.mujoco_sim.car_mujoco import MuJoCoCar
 
 def align_yaw(yaw_1, yaw_2):
     d_yaw = yaw_1 - yaw_2
@@ -21,86 +26,108 @@ class DynamicsJax:
     def __init__(self, params: dict):
         self.params = deepcopy(params)
         
-        model_path = self.params.get("model_path", "")
-        
         self.key = jax.random.PRNGKey(123)
-        state_dim = 6
-        action_dim = 2
-        latent_dim = 64
-        num_heads = 4
-        num_layers = 2
-        dropout = 0.1
-        history_length = 250
-        prediction_length = 50
-        batch_size = 512
+
+        self.load_jax_model()
+
+        # # Print the model structure, and count the number of parameters
+        # param_count = sum(x.size for x in jax.tree_leaves(raw_restored['model']['params']))
+        # print(f"Number of parameters: {param_count}")
+
+        # self.var['params'] = raw_restored['model']['params']
+        # self.input_mean = jnp.array(raw_restored['input_mean'])
+        # self.input_std = jnp.array(raw_restored['input_std'])
         
-        self.model = JaxTransformerDecoder(state_dim, action_dim, state_dim, latent_dim, num_heads, num_layers, dropout, history_length, prediction_length, jnp.bfloat16)
-        
-        jax_history_input = jnp.ones((batch_size, history_length, state_dim + action_dim), dtype=jnp.float32)
-        jax_history_mask = jnp.ones((batch_size, history_length * 2 - 1), dtype=jnp.float32)
-        jax_prediction_input = jnp.ones((batch_size, prediction_length, action_dim), dtype=jnp.float32)
-        jax_prediction_mask = jnp.ones((batch_size, prediction_length), dtype=jnp.float32)
-        
+        # print("input_mean", self.input_mean)
+        # print("input_std", self.input_std)
+
+    def load_jax_model(self):
+        self.model = model = JaxDynamicsPredictor(
+            model_dim=self.params['model_dim'],
+            output_dim=self.params['state_dim']
+        )
+        dummy_hist = jnp.ones((1, self.params['history_length'], self.params['num_entities'], self.params['history_dim']))
+        dummy_static = jnp.ones((1, self.params['num_entities'], self.params['static_dim']))
+
         self.key, key2 = jax.random.split(self.key, 2)
-        self.var = self.model.init(key2, jax_history_input, jax_prediction_input, jax_history_mask, jax_prediction_mask)
-        
-        orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        print(colored(f"Loading model from: {model_path}", "green"))
-        raw_restored = orbax_checkpointer.restore(model_path)
-        
-        # Print the model structure, and count the number of parameters
-        # orbax_utils.print_model_structure(raw_restored['model'])
-        # orbax_utils.count_parameters(raw_restored['model'])
-        param_count = sum(x.size for x in jax.tree_leaves(raw_restored['model']['params']))
-        # print(f"model structu: {raw_restored['model']}")
-        print(f"Number of parameters: {param_count}")
-        # import pdb; pdb.set_trace()
-        
-        # self.var['params'] = raw_restored['params']
-        # self.input_mean = jnp.array([3.3083595e-02, 1.4826456e-04, 1.8982769e-03, 1.6544139e+00, 5.5305376e-03, 9.5738873e-02])
-        # self.input_std = jnp.array([0.01598073, 0.00196785, 0.01215522, 0.7989133 , 0.09668902 ,0.608985  ])
-        
-        self.var['params'] = raw_restored['model']['params']
-        self.input_mean = jnp.array(raw_restored['input_mean'])
-        self.input_std = jnp.array(raw_restored['input_std'])
-        
-        print("input_mean", self.input_mean)
-        print("input_std", self.input_std)
-        
+        self.var = self.model.init(key2, dummy_hist, dummy_static)
+        params = self.var['params']
+
+        from car_foundation.train_jax_dynamics_predictor import TrainState
+        self.model_state = TrainState.create(
+            apply_fn=model.apply,
+            params=params,
+            tx=optax.adamw(1e-4),
+            rng=self.key
+        )
+
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        manager = orbax.checkpoint.CheckpointManager(
+            self.params['model_path'],
+            checkpointer,
+            orbax.checkpoint.CheckpointManagerOptions()
+        )
+
+        step = manager.latest_step()
+        print("Restoring checkpoint at step:", step)
+
+        restore_target = {
+            'model': self.model_state,
+            'config': {
+                'target_scale': 100.0,
+                'dims': (self.params['history_dim'], self.params['static_dim'])
+            }
+        }
+
+        self.ckpt = manager.restore(
+            step,
+            restore_target
+        )    
         
     @partial(jax.jit, static_argnums=(0,))
-    def step(self, key, history: jax.Array, state: jax.Array, action: jax.Array):
+    def step(self, key, history: jax.Array, state: jax.Array, action: jax.Array, static_features: jax.Array):
+        """
+        
+        History: (Batch, L, E, H)
+        State: (Batch, E, X)
+        Action: (Batch, T_future, E, A)
+        """
         st_nn_dyn = time.time()
 
-        # convert pose state to delta
-        original_yaw = history[:, :-1, 2]
-        batch_tf = history
-        batch_tf = batch_tf.at[:, 1:, :3].set(batch_tf[:, 1:, :3] - batch_tf[:, :-1, :3])
-        batch_tf = batch_tf.at[:, 1:, 2].set(align_yaw(batch_tf[:, 1:, 2], 0.0))
-        # rotate dx, dy into body frame
-        batch_tf_x = batch_tf[:, 1:, 0] * jnp.cos(original_yaw) + batch_tf[:, 1:, 1] * jnp.sin(original_yaw)
-        batch_tf_y = -batch_tf[:, 1:, 0] * jnp.sin(original_yaw) + batch_tf[:, 1:, 1] * jnp.cos(original_yaw)
-        batch_tf = batch_tf.at[:, 1:, 0].set(batch_tf_x)
-        batch_tf = batch_tf.at[:, 1:, 1].set(batch_tf_y)
-        batch_tf = batch_tf.at[:, :, :6].set((batch_tf[:, :, :6] - self.input_mean) / self.input_std)
+        action_seq = jnp.swapaxes(action, 0, 1) # (T_future, Batch, E, A)
 
-        x = batch_tf[:, 1:, :]
-        key, key2 = jax.random.split(key, 2)
-        # print("Shape inside", action.shape)
-        y_pred = ( self.model.apply(self.var, x, action, action_padding_mask=None, rngs=key2, deterministic=True) * self.input_std + self.input_mean ) #* self.input_std + self.input_mean
+        def scan_step(carry, action_t):
+            key, history, state = carry
 
-        last_pose = history[:, -1, :3]
-        for i in range(y_pred.shape[1]):
-            # rotate dx, dy back to world frame
-            y_pred_x = y_pred[:, i, 0] * jnp.cos(last_pose[:, 2]) - y_pred[:, i, 1] * jnp.sin(last_pose[:, 2])
-            y_pred_y = y_pred[:, i, 0] * jnp.sin(last_pose[:, 2]) + y_pred[:, i, 1] * jnp.cos(last_pose[:, 2])
-            y_pred = y_pred.at[:, i, 0].set(y_pred_x)
-            y_pred = y_pred.at[:, i, 1].set(y_pred_y)
-            # accumulate the poses
-            y_pred = y_pred.at[:, i, :3].set(y_pred[:, i, :3] + last_pose)
-            y_pred = y_pred.at[:, i, 2].set( align_yaw(y_pred[:, i, 2], 0.0) )
-            last_pose = y_pred[:, i, :3]
+            # Update history
+            current_history = jnp.concatenate(
+                [state, action_t], axis=-1
+            )  # (Batch, E, H)
+
+            history = jnp.concatenate(
+                [history[:, 1:], current_history[:, None]],
+                axis=1
+            )
+
+            key, subkey = jax.random.split(key)
+
+            pred_delta = self.model_state.apply_fn(
+                {'params': self.model_state.params},
+                history,
+                static_features,
+                rngs=subkey,
+            ) / self.ckpt['config']['target_scale']
+
+            state = state + pred_delta
+
+            return (key, history, state), None
+
+        (key, history, state), _ = jax.lax.scan(
+            scan_step,
+            (key, history, state),
+            action_seq,
+        )
             
         print("NN Inference Time", time.time() - st_nn_dyn)
-        return y_pred
+        return history[:,-action.shape[1]:, :,:self.params['state_dim']]
         
