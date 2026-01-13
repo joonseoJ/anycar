@@ -15,6 +15,7 @@ from car_planner.utils import (
 import matplotlib.pyplot as plt
 import copy
 import time
+from car_foundation.utils import quaternion_to_euler
 
 
 class GlobalTrajectory:
@@ -290,10 +291,13 @@ class GlobalTrajectory:
         return self.total_length_
 
     def generate(self, obs: np.ndarray, dt: float, h: int, return_frenet_pose = False) -> np.ndarray:
+        """
+        obs: Root pose (x,y,z, qw, qx, qy, qz) and Twist (vx, vy, vz, wx, wy, wz)
+        """
         # TODO: accept a list of vels
         st = time.time()
         pos2d = obs[:2]
-        psi = obs[2]
+        _,_, psi = quaternion_to_euler(obs[3:7])
         vel2d = obs[3:5]
         vel = np.linalg.norm(vel2d)
         vel = np.clip(vel, 0.2, float("inf"))

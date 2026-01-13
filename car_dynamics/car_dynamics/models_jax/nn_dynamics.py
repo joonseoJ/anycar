@@ -95,14 +95,21 @@ class DynamicsJax:
         st_nn_dyn = time.time()
 
         action_seq = jnp.swapaxes(action, 0, 1) # (T_future, Batch, E, A)
+        L = history.shape[1]
+        history_expanded = jnp.concatenate(
+            [history, jnp.zeros((history.shape[0], action_seq.shape[0], *history.shape[2:] ))],
+            axis=1
+        ) # (Batch, L+T_future, E, H)
 
         def scan_step(carry, action_t):
-            key, history, state = carry
+            key, history, history_expanded, state, index = carry
 
             # Update history
             current_history = jnp.concatenate(
                 [state, action_t], axis=-1
             )  # (Batch, E, H)
+
+            history_expanded.at[:, index, :, :].set(current_history)
 
             history = jnp.concatenate(
                 [history[:, 1:], current_history[:, None]],
@@ -120,14 +127,14 @@ class DynamicsJax:
 
             state = state + pred_delta
 
-            return (key, history, state), None
+            return (key, history, history_expanded, state, index+1), None
 
-        (key, history, state), _ = jax.lax.scan(
+        (key, history, history_expanded, state, index), _ = jax.lax.scan(
             scan_step,
-            (key, history, state),
+            (key, history, history_expanded, state, L),
             action_seq,
         )
             
         print("NN Inference Time", time.time() - st_nn_dyn)
-        return history[:,-action.shape[1]:, :,:self.params['state_dim']]
+        return history_expanded[:,-action.shape[1]:, :,:self.params['state_dim']]
         

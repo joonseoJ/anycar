@@ -45,6 +45,8 @@ class HyperparameterManager:
         
 
 def quaternion_to_euler(q):
+    if q.ndim == 1:
+        q = q.reshape(1,-1)
     # Normalize quaternion
     norm = np.linalg.norm(q, axis=1)[:, np.newaxis]
     q = q / norm

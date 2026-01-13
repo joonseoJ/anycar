@@ -27,6 +27,7 @@ from car_foundation import CAR_FOUNDATION_MODEL_DIR
 from car_ros2.utils import load_mppi_params, load_dynamic_params
 
 import jax
+import jax.numpy as jnp
 
 import faulthandler
 faulthandler.enable()
@@ -86,9 +87,9 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
     mppi_running_params = mppi.get_init_params()
     key_i, key2 = jax.random.split(key_i)
     mppi_running_params = MPPIRunningParams(
-        a_mean = mppi_running_params.a_mean,
-        a_cov = mppi_running_params.a_cov,
-        prev_a = mppi_running_params.prev_a,
+        a_mean_flattened = mppi_running_params.a_mean_flattened,
+        a_cov_flattened = mppi_running_params.a_cov_flattened,
+        prev_a_flattened = mppi_running_params.prev_a_flattened,
         state_hist = mppi_running_params.state_hist,
         key = key2,
     )
@@ -102,59 +103,71 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
     is_terminate = False 
     clipped = 0
     actions = []
-    history_length = env.observation_space['history'].shape[0]
+    history_length = mppi.params.len_history
     for t in tqdm(range(simend)):
-        state = env.obs_state()
+        obs = env.obs_state()
+        state = obs['current_state']
+        static_features = obs['static_features']
         
         if t == 0:
             for _ in range(history_length):
-                mppi_running_params = mppi.feed_hist(mppi_running_params, state, np.array([0., 0.]))
+                mppi_running_params = mppi.feed_hist(mppi_running_params, state, np.zeros((mppi.params.num_entities, mppi.params.num_actions)))
 
-        target_pos_arr, frenet_pose = global_planner.generate(state[:5], env.sim.params.DT, (mppi_params.h_knot - 1) * mppi_params.num_intermediate + 2 + mppi_params.delay, True)
+        target_pos_arr, frenet_pose = global_planner.generate(
+            state[0, :], 
+            env.dt, 
+            (mppi_params.h_knot - 1) * mppi_params.num_intermediate + 2 + mppi_params.delay, 
+            True
+        )
         target_pos_list = np.array(target_pos_arr)
         target_pos_tensor = jnp.array(target_pos_arr)
         dynamic_params_tuple = (model_params.LF, model_params.LR, model_params.MASS, model_params.DT, model_params.K_RFY, model_params.K_FFY, model_params.Iz, model_params.Ta, model_params.Tb, model_params.Sa, model_params.Sb, model_params.mu, model_params.Cf, model_params.Cr, model_params.Bf, model_params.Br, model_params.hcom, model_params.fr)
         
-        action, mppi_running_params, mppi_info = mppi(state,target_pos_tensor, mppi_running_params, dynamic_params_tuple, vis_optim_traj=True,)
+        action, mppi_running_params, mppi_info = mppi(
+            state, 
+            target_pos_tensor, 
+            mppi_running_params, 
+            static_features[:,:6], 
+        )
         mppi_running_params = mppi.feed_hist(mppi_running_params, state, action)
         
         obs, reward, done, info = env.step(np.array(action))
 
-        log_data(dataset, obs)
+        # log_data(dataset, obs)
 
         # check if the robot screwed up
         #TODO Fix when adding slope changes to the world.
-        if np.abs(env.world.rpy[0]) > 0.05 or np.abs(env.world.rpy[1]) > 0.05:
-            is_terminate = True
-            break
+        # if np.abs(env.world.rpy[0]) > 0.05 or np.abs(env.world.rpy[1]) > 0.05:
+        #     is_terminate = True
+        #     break
     
-    if not is_terminate:
-        # dataset.data_logs["lap_end"][-1] = 1 
-        now = datetime.datetime.now().isoformat(timespec='milliseconds')
-        file_name = "log_" + str(id) + '_' + str(now) + ".pkl"
-        filepath = os.path.join(datadir, file_name)
+    # if not is_terminate:
+    #     # dataset.data_logs["lap_end"][-1] = 1 
+    #     now = datetime.datetime.now().isoformat(timespec='milliseconds')
+    #     file_name = "log_" + str(id) + '_' + str(now) + ".pkl"
+    #     filepath = os.path.join(datadir, file_name)
         
-        for key, value in dataset.data_logs.items():
-            dataset.data_logs[key] = np.array(value)
+    #     for key, value in dataset.data_logs.items():
+    #         dataset.data_logs[key] = np.array(value)
 
-        with open(filepath, 'wb') as outp: 
-            pickle.dump(dataset, outp, pickle.HIGHEST_PROTOCOL)
+    #     with open(filepath, 'wb') as outp: 
+    #         pickle.dump(dataset, outp, pickle.HIGHEST_PROTOCOL)
 
-        print("Saved Data to:", filepath)
+    #     print("Saved Data to:", filepath)
 
-        # if debug_plots:
-        #     actions = np.array(actions)
-        #     print(actions.shape)
-        #     plt.plot(actions, label = "actual command")
-        #     # plt.plot(actions[:, 1], label = "steering")
-        #     # plt.plot(ppcontrol.target_velocities, label="targetvel")
-        #     plt.legend()
-        #     plt.show()
-        #     plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
-        #     plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
-        #     plt.show()
+    #     # if debug_plots:
+    #     #     actions = np.array(actions)
+    #     #     print(actions.shape)
+    #     #     plt.plot(actions, label = "actual command")
+    #     #     # plt.plot(actions[:, 1], label = "steering")
+    #     #     # plt.plot(ppcontrol.target_velocities, label="targetvel")
+    #     #     plt.legend()
+    #     #     plt.show()
+    #     #     plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
+    #     #     plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
+    #     #     plt.show()
         
-        dataset.reset_logs()
+    #     dataset.reset_logs()
             
     print("Simulation Complete!")
     print("Total Timesteps: ", simend + 1)
@@ -163,19 +176,28 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
 
 if __name__ == "__main__":
     jax_key = jax.random.PRNGKey(0)
-    render = False
+    render = True
     debug_plots = False
     simend = 20000
     episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
-    resume_model_name = "2026-01-07T14:11:07.903-jax_model_checkpoint"
-    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name, "checkpoint_0")
+    resume_model_name = "2026-01-08T15:48:33.113-model_checkpoint"
+    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
     os.makedirs(data_dir, exist_ok=True)
 
     mppi_params = load_mppi_params()
     model_params = load_dynamic_params()
     jax_key, key2 = jax.random.split(jax_key)
-    dynamics = DynamicsJax({'model_path': resume_model_folder_path})
+    dynamics = DynamicsJax({
+        'model_path': resume_model_folder_path,
+        'model_dim': 128,
+        'state_dim': 13,
+        'action_dim': 6,
+        'static_dim': 6,
+        'history_dim': 19,
+        'history_length': 100,
+        'num_entities': 5,
+    })
     mppi_rollout_fn = rollout_fn_jax(dynamics)
     mppi = MPPIController(
         mppi_params, mppi_rollout_fn, empty_fn, key2
