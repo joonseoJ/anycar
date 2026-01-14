@@ -19,13 +19,27 @@ from car_dynamics import MUJOCO_MODEL_DIR
 
 from car_dynamics.envs.mujoco_sim.car_mujoco import MuJoCoCar
 from car_dynamics.controllers_torch import AltPurePursuitController, RandWalkController
+from car_dynamics.models_jax import DynamicsJax
+from car_foundation import CAR_FOUNDATION_MODEL_DIR
+from car_foundation import model_config
+
+import jax
+import jax.numpy as jnp
 
 import faulthandler
 faulthandler.enable()
 
-def log_data(dataset, state, action):
-    dataset.data_logs["state"].append(state)
-    dataset.data_logs["action"].append(action)
+def visualize_diff(diff):
+    plt.figure()
+    plt.imshow(diff)
+    plt.colorbar()
+    plt.title("Difference between NumPy and JAX")
+    plt.xlabel("Column")
+    plt.ylabel("Row")
+    plt.show()
+
+    print("max diff:", diff.max())
+    print("mean diff:", diff.mean())
 
 def get_rollout_fn(use_ray):
     if use_ray:
@@ -38,28 +52,53 @@ def rollout(id, simend, render, debug_plots, datadir):
 
     dataset = CarDataset()
     env = MuJoCoCar({'is_render': render}) # create the simulation environment
+    obs = env.reset()
 
-    dataset.car_params = env.change_parameters()
+    # set the simulator
+    dataset.car_params["sim"] = env.name
+    # set the wheelbase
+    dataset.car_params["wheelbase"] = env.wheelbase
+    # generate a new mass
+    dataset.car_params["mass"] = env.generate_new_mass()
+    # generate a new com
+    dataset.car_params["com"] = env.generate_new_com()
+    # generate a new friction
+    dataset.car_params["friction"] = env.generate_new_friction()
+    # generate new max throttle
+    dataset.car_params["max_throttle"] = env.generate_new_max_throttle()
+    # generate new delay
+    dataset.car_params["delay"] = env.generate_new_delay()
+    # generate new max steering
+    dataset.car_params["max_steer"] = env.generate_new_max_steering()
+    # generate new steering bias
+    dataset.car_params["steer_bias"] = env.generate_new_steering_bias()
+
+    # fine tuning data collection
+    # dataset.car_params['mass'] = 3.794
+    # dataset.car_params['friction'] = 1.
+    # dataset.car_params['max_throttle'] = 10.
+    # dataset.car_params['delay'] = 4
+
+    print("Car Params", dataset.car_params)
+
+    #choose to change parameters or not
+    env.world.change_parameters(dataset.car_params)
 
     direction = np.random.choice([-1, 1])
     scale = int(np.random.uniform(1, 5))
 
     #wenli where did you get the lower vel from?
-    fwd_or_bwd = random.choice([-1,1])
     ppcontrol = AltPurePursuitController({
         'wheelbase': dataset.car_params["wheelbase"], 
         'totaltime': simend,
-        'lowervel': 0.1*fwd_or_bwd, #actual min vel
-        'uppervel': 2.*fwd_or_bwd, #actual max vel   
+        'lowervel': 0.7, #actual min vel
+        'uppervel': 2., #actual max vel   
         'max_steering': env.world.max_steer    
     })
 
     controller = ppcontrol #all_controllers[np.random.choice([0, 1])]
     trajectory = change_track(scale, direction)
-    env.world.trajectory = [{
-        "traj": trajectory,
-        "rgba": np.array([1.0, 0.0, 0.0, 1.0])
-    }]
+    env.world.trajectory = trajectory
     
     # tuned kp and kd
     kp = np.random.uniform(6, 10)
@@ -70,10 +109,28 @@ def rollout(id, simend, render, debug_plots, datadir):
     clipped = 0
     actions = []
 
-    obs = env.reset()
-    state = obs['current_state']
-    dataset.car_params["static_features"] = obs['static_features']
-    for t in tqdm(range(simend)):
+
+    resume_model_name = "2026-01-14T11:14:00.296-model_checkpoint"
+    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
+    dynamics = DynamicsJax({
+        'model_path': resume_model_folder_path,
+        'model_dim': model_config.MODEL_DIM,
+        'state_dim': model_config.STATE_DIM,
+        'action_dim': model_config.ACTION_DIM,
+        'static_dim': model_config.STATIC_DIM,
+        'history_dim': model_config.HISTORY_DIM,
+        'history_length': 100,
+        'num_entities': model_config.NUM_ENTITIES,
+        'num_heads': model_config.NUM_HEADS,
+        'num_layers': model_config.NUM_LAYERS
+    })
+    jax_key = jax.random.PRNGKey(0)
+    for t in range(simend):
+        if t == 0:
+            state = obs['current_state']
+            history = jnp.tile(state[None, None, :, :], (1, dynamics.params['history_length'], 1, 1))
+            history = jnp.concatenate([history, jnp.zeros((*history.shape[:3], 6))], axis=-1)
+                
 
         action = controller.get_control(t, env.world, trajectory)
         if controller.name == "pure_pursuit":
@@ -90,51 +147,41 @@ def rollout(id, simend, render, debug_plots, datadir):
             raise ValueError(f"Unknown Controller: {controller.name}")
 
         action_matrix = np.zeros(env.action_space.shape)
-        action_matrix[:,4] = action[0] + np.random.normal(0, 0.1, size=(5,))
-        action_matrix[1:3,5] = action[1] + np.random.normal(0, 0.01, size=(2,))
-        action_matrix[3:5,5] = -action[1] + np.random.normal(0, 0.01, size=(2,))
+        action_matrix[:,4] = action[0]
+        action_matrix[:,5] = action[1]
         #TODO Fix this, the action is getting clipped like 25% of the time
         action_matrix = np.clip(action_matrix, env.action_space.low, env.action_space.high)
-        log_data(dataset, state, action_matrix)
-
         # actions.append(action[0]) 
         obs, reward, done, info = env.step(action_matrix)
         state = obs['current_state']
 
+
+        jax_key, key2 = jax.random.split(jax_key)
+        state_nn = dynamics.model_state.apply_fn(
+            {'params': dynamics.model_state.params},
+            history,
+            obs['static_features'][None],
+            action_matrix[None,None],
+            rngs=key2,
+        )
+        state_nn = np.array(state_nn[0, 0,:])
+        diff = np.abs(state - state_nn)
+
+        visualize_diff(diff)
 
         # check if the robot screwed up
         #TODO Fix when adding slope changes to the world.
         if np.abs(env.world.rpy[0]) > 0.05 or np.abs(env.world.rpy[1]) > 0.05:
             is_terminate = True
             break
-    
-    if not is_terminate:
-        # dataset.data_logs["lap_end"][-1] = 1 
-        now = datetime.datetime.now().isoformat(timespec='milliseconds')
-        file_name = "log_" + str(id) + '_' + str(now) + ".pkl"
-        filepath = os.path.join(datadir, file_name)
-        
-        for key, value in dataset.data_logs.items():
-            dataset.data_logs[key] = np.array(value)
-
-        with open(filepath, 'wb') as outp: 
-            pickle.dump(dataset, outp, pickle.HIGHEST_PROTOCOL)
-
-        print("Saved Data to:", filepath)
-
-        # if debug_plots:
-        #     actions = np.array(actions)
-        #     print(actions.shape)
-        #     plt.plot(actions, label = "actual command")
-        #     # plt.plot(actions[:, 1], label = "steering")
-        #     # plt.plot(ppcontrol.target_velocities, label="targetvel")
-        #     plt.legend()
-        #     plt.show()
-        #     plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
-        #     plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
-        #     plt.show()
-        
-        dataset.reset_logs()
+   
+        current_history = jnp.concatenate(
+            [state, action_matrix], axis=-1
+        )
+        history = jnp.concatenate(
+            [history[:, 1:], current_history[None, None, :, :]],
+            axis=1
+        )
             
     print("Simulation Complete!")
     print("Total Timesteps: ", simend + 1)
@@ -143,10 +190,10 @@ def rollout(id, simend, render, debug_plots, datadir):
 
 if __name__ == "__main__":
 
-    render = False
+    render = True
     debug_plots = False
-    simend = 5000
-    episodes = 1000
+    simend = 20000
+    episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
     os.makedirs(data_dir, exist_ok=True)
 

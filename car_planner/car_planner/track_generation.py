@@ -10,8 +10,8 @@ def generate_random_points(num_points = 10, scale = 1):
     points = []
     min_distance = int(4 * scale)
     for i in range(num_points):
-        x = random.randrange(0,  int(20 * scale), 1)
-        y = random.randrange(0, int(20 * scale), 1)
+        x = random.randrange(-int(10 * scale),  int(10 * scale), 1)
+        y = random.randrange(int(-10 * scale), int(10 * scale), 1)
         distances = list(filter(lambda x: x < min_distance, [math.sqrt((p[0]-x)**2 + (p[1]-y)**2) for p in points]))
         if len(distances) == 0:
             points.append((x, y))

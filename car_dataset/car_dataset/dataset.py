@@ -11,15 +11,16 @@ class CarDataset:
                            'max_throttle': None, 
                            'max_steer': None,
                            'steer_bias': None,
-                           "sim": None,}
+                           "sim": None,
+                           "static_features": None}
 
     
     def reset_logs(self):
         self.data_logs = {
-            "history": [],
-            "static_features": [],
-            "current_state": [],
+            "state": [],
+            "action": [],
         } 
         
     def __len__(self):
-        return len(self.data_logs["history"])
+        assert len(self.data_logs["state"]) == len(self.data_logs["action"])
+        return len(self.data_logs["state"])

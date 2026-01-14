@@ -83,13 +83,16 @@ def generate_xml(wheel_configs) -> str:
                     <geom contype="0" conaffinity="0" group="1" rgba="1 1 1 1"/>
                 </default>
                 <default class="p_x">
-                    <joint type="slide" axis="1 0 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                    <joint type="slide" axis="1 0 0" limited="true" range="-0.1 0.1" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
                 <default class="p_y">
-                    <joint type="slide" axis="0 1 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                    <joint type="slide" axis="0 1 0" limited="true" range="-0.1 0.1" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
-                <default class="p_z">
-                    <joint type="slide" axis="0 0 1" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                <default class="suspension">
+                    <joint type="slide" axis="0 0 1" limited="true" range="-0.05 0.05" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
                 <default class="camber">
                     <joint type="hinge" axis="1 0 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-0.1 0.1"/>
@@ -107,7 +110,7 @@ def generate_xml(wheel_configs) -> str:
                 <geom type="plane" size="300 300 .01" material="grid"/>
 
                 <body name="root" pos="0.0 0.0 0.0" euler="0.0 0.0 0.0">
-                    <camera name="track" mode="trackcom" pos="0 0 3.0" xyaxes="1 0 0 0 1 0"/>
+                    <camera name="track" mode="trackcom" pos="0 -2 2" xyaxes="1 0 0 0 0.7 0.7"/>
                     <joint type="free"/>
                     <site name="root_site" pos="0.0 0.0 0.0"/>
                     <geom name="root" type="mesh" mesh="chassis" pos="0 0 0.094655"/>
@@ -117,7 +120,7 @@ def generate_xml(wheel_configs) -> str:
         # Dynamically add wheels
         for i, wheel_config in enumerate(wheel_configs):
             mjcf += f"""
-                    <body name="wheel_{i}_knuckle" pos="{wheel_config["pos"]}">
+                    <body name="wheel_{i}_knuckle" pos="{' '.join(map(str, wheel_config["pos"]))}">
                         <inertial pos="0 0 0" mass="0.05" diaginertia="0.001 0.001 0.001"/>
                         <site name="wheel_{i}_knuckle_site" pos="0 0 0" size="0.01" rgba="0 0 0 0.1"/>
                     """
@@ -129,10 +132,10 @@ def generate_xml(wheel_configs) -> str:
                 mjcf += f"""
                         <joint class="p_y" name="p_y_{i}"/>
                         """
-            if wheel_config["mask"][2]:
-                mjcf += f"""
-                        <joint class="p_z" name="p_z_{i}"/>
-                        """
+            # if wheel_config["mask"][2]:
+            mjcf += f"""
+                    <joint class="suspension" name="suspension_{i}"/>
+                    """
             if wheel_config["mask"][3]:
                 mjcf += f"""
                         <joint class="camber" name="camber_{i}"/>
@@ -144,7 +147,8 @@ def generate_xml(wheel_configs) -> str:
             mjcf += f"""
                         <body name="wheel_{i}_rim" pos="0 0 0" zaxis="0 1 0">
                             <joint class="throttle" name="throttle_{i}"/>
-                            <geom type="cylinder" size="{wheel_config["radius"]} {wheel_config["width"]}" mass="{wheel_config["mass"]}" rgba=".5 .5 1 1" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
+                            <geom name="wheel_{i}_rim" type="cylinder" size="{wheel_config["radius"]} {wheel_config["width"]}" mass="{wheel_config["mass"]}" rgba=".5 .5 1 1" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
+                            <geom name="wheel_{i}_marker" type="box" pos="0 {wheel_config["radius"]} 0" size="0.005 0.02 0.005" rgba="1 0 0 1" contype="0" conaffinity="0" density="0"/>
                             <site name="wheel_{i}_rim_site" pos="0 0 0" type="box" size=".006 .03 .015" rgba="1 0 0 1"/>
                         </body>
                     </body>
@@ -160,15 +164,15 @@ def generate_xml(wheel_configs) -> str:
         for i, wheel_config in enumerate(wheel_configs):
             if wheel_config["mask"][0]:
                 mjcf += f"""
-                        <position class="p_x" kp="25.0" name="p_x_{i}" joint="p_x_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="p_x_{i}" joint="p_x_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][1]:
                 mjcf += f"""
-                        <position class="p_y" kp="25.0" name="p_y_{i}" joint="p_y_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="p_y_{i}" joint="p_y_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][2]:
                 mjcf += f"""
-                        <position class="p_z" kp="25.0" name="p_z_{i}" joint="p_z_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="sus_{i}" joint="suspension_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][3]:
                 mjcf += f"""
@@ -236,7 +240,7 @@ class World:
         if not self.xml_path:
             self.xml_path = generate_xml(self.wheel_configs)
         model, data, cam, opt, scene, context, window  = initialize_environment(self.xml_path, self.timestep, self.is_render)
-        
+
         self.model = model
         self.data = data
         self.cam = cam
@@ -244,16 +248,34 @@ class World:
         self.scene = scene
         self.context = context
         self.window = window
+
+        if self.render and self.scene:
+            mj.mjv_updateScene(self.model, self.data, self.opt, None, self.cam,
+                            mj.mjtCatBit.mjCAT_ALL.value, self.scene)
+            self.traj_geom_start = self.scene.ngeom
         
         self.dt = self.model.opt.timestep
         self.warmup_steps = int(2. / self.timestep)
 
         self.root_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "root")
+        self.root_joint_id = self.model.body_jntadr[self.root_id]
+        self.root_qpos_adr = self.model.jnt_qposadr[self.root_joint_id]
+        self.root_geom_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, "root")
+        self.num_wheels = len(self.wheel_configs)
+        
+        self.knuckle_body_ids = []
+        self.rim_body_ids = []
+        self.rim_geom_ids = []
+        for i in range(self.num_wheels):
+            self.knuckle_body_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, f"wheel_{i}_knuckle"))
+            self.rim_body_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, f"wheel_{i}_rim"))
+            self.rim_geom_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, f"wheel_{i}_rim"))
         
         
     def reset(self, ):
-        # self.model.body_pos[1] = np.hstack((trajectory[0],[0]))
         mj.mj_resetData(self.model, self.data)
+        if hasattr(self, 'trajectory') and self.trajectory is not None:
+            self.data.qpos[self.root_qpos_adr: self.root_qpos_adr+2] = self.trajectory[0]['traj'][0] + np.random.normal(0, 0.01, size=2)
         mj.mj_forward(self.model, self.data)
         for _ in range(self.warmup_steps):
             self.data.ctrl[:] = 0.0
@@ -287,6 +309,7 @@ class World:
         update_camera(self.cam, self.data.geom_xpos[1])
         mj.mjv_updateScene(self.model, self.data, self.opt, None, self.cam,
                         mj.mjtCatBit.mjCAT_ALL.value, self.scene)
+        mj.mjr_render(viewport, self.scene, self.context)
         self._render_trajectory()
         
         mj.mjr_render(viewport, self.scene, self.context)
@@ -296,44 +319,54 @@ class World:
     def _render_trajectory(self):
         if not hasattr(self, 'trajectory') or self.trajectory is None:
             return
-        wps = self.trajectory
-        N = wps.shape[0]
         
-        # 선의 두께 (미터 단위) 및 높이 설정
-        line_width = 0.05 
-        z_height = 0.05 # 바닥(0.0)보다 살짝 띄워야 보임
-
-        for i in range(N - 1):
-            # Scene의 최대 지오메트리 개수를 넘으면 그리기 중단 (에러 방지)
-            if self.scene.ngeom >= self.scene.maxgeom:
-                break
+        self.scene.ngeom = self.traj_geom_start
+        
+        for d in self.trajectory:
+            wps = d['traj']
+            N = wps.shape[0]
             
-            # 현재 그릴 점 두 개 (시작점, 끝점) + Z축 추가
-            p1 = np.array([wps[i,0 ],   wps[i, 1],   z_height])
-            p2 = np.array([wps[i+1, 0], wps[i+1, 1], z_height])
+            # 선의 두께 (미터 단위) 및 높이 설정
+            line_width = 0.005 
+            z_height = 0.05 # 바닥(0.0)보다 살짝 띄워야 보임
 
-            # 빈 지오메트리 슬롯 가져오기
-            geom = self.scene.geoms[self.scene.ngeom]
-            self.scene.ngeom += 1 # 사용한 슬롯 개수 증가
+            for i in range(N - 1):
+                # Scene의 최대 지오메트리 개수를 넘으면 그리기 중단 (에러 방지)
+                if self.scene.ngeom >= self.scene.maxgeom:
+                    break
+                
+                # 현재 그릴 점 두 개 (시작점, 끝점) + Z축 추가
+                p1 = np.array([wps[i,0 ],   wps[i, 1],   z_height])
+                p2 = np.array([wps[i+1, 0], wps[i+1, 1], z_height])
 
-            # 지오메트리 초기화 (색상: RGBA)
-            mj.mjv_initGeom(
-                geom,
-                type=mj.mjtGeom.mjGEOM_CAPSULE, # 선보다 캡슐이 훨씬 잘 보입니다
-                size=np.zeros(3),
-                pos=np.zeros(3),
-                mat=np.eye(3).flatten(),
-                rgba=np.array([1.0, 0.0, 0.0, 1.0]) # 빨간색
-            )
+                # 빈 지오메트리 슬롯 가져오기
+                geom = self.scene.geoms[self.scene.ngeom]
+                self.scene.ngeom += 1 # 사용한 슬롯 개수 증가
 
-            # 두 점을 잇는 커넥터 설정
-            mj.mjv_connector(
-                geom,
-                mj.mjtGeom.mjGEOM_CAPSULE,
-                line_width,
-                p1,
-                p2
-            )
+                # 지오메트리 초기화 (색상: RGBA)
+                mj.mjv_initGeom(
+                    geom,
+                    type=mj.mjtGeom.mjGEOM_ARROW, # 선보다 캡슐이 훨씬 잘 보입니다
+                    size=line_width*np.array([1, 2, 4]), # shaft radius, head radius, head length
+                    pos=p1,
+                    mat=np.eye(3).flatten(),
+                    rgba=d['rgba']
+                )
+
+                # geom.data.fromto[0:3] = p1
+                # geom.data.fromto[3:6] = p2
+                # geom.data.size[0] = line_width # shaft radius
+                # geom.data.size[1] = line_width * 2  # head radius
+                # geom.data.size[2] = line_width * 4  # head length
+
+                # 두 점을 잇는 커넥터 설정
+                mj.mjv_connector(
+                    geom,
+                    mj.mjtGeom.mjGEOM_ARROW,
+                    line_width,
+                    p1,
+                    p2
+                )
 
     @property
     def pose(self):
@@ -404,6 +437,18 @@ class World:
     def wheel_quat(self, i):
         return self.data.sensor(f"wheel_{i}_quat").data.copy()
     
+    def wheel_rpy(self, i):
+        quat = self.wheel_quat(i)
+        r = R.from_quat(quat[[1,2,3,0]])
+        orientation = r.as_euler("xyz")
+        return np.array(
+            [
+                orientation[0],
+                orientation[1],
+                orientation[2],
+            ]
+        ).copy()
+    
     def wheel_lin_vel(self, i):
         return self.data.sensor(f"wheel_{i}_lin_vel").data.copy()
     
@@ -414,15 +459,27 @@ class World:
         if change:
             for key, item in parameters.items():
                 if key == "mass":
-                    self.model.body_mass[1] = item
+                    self.model.body_mass[self.root_id] = item
                 elif key == "com":
-                    self.model.body_ipos[1] = item
+                    self.model.body_ipos[self.root_id] = item
                 elif key == "friction":
-                    self.model.geom_friction[2] = item
-                    self.model.geom_friction[3] = item
-                    self.model.geom_friction[4] = item
-                    self.model.geom_friction[5] = item
-                    self.model.geom_friction[0] = item
+                    self.model.geom_friction[self.root_geom_id] = item
+                    for geom_id in self.rim_geom_ids:
+                        self.model.geom_friction[geom_id] = item
+                elif key == "wheel_parameters":
+                    radius, width, mass = item
+                    for geom_id in self.rim_geom_ids:
+                        self.model.geom_size[geom_id][:2] = [radius, width]
+                    for body_id in self.rim_body_ids:
+                        self.model.body_mass[body_id] = mass
+                elif key == "wheel_base":
+                    front, rear = item
+                    for i, body_id in enumerate(self.knuckle_body_ids):
+                        self.model.body_pos[body_id][0] = front if i < 2 else rear
+                elif key == "wheel_track":
+                    half_track = item/2.0
+                    for i, body_id in enumerate(self.knuckle_body_ids):
+                        self.model.body_pos[body_id][1] = half_track if i %2==0 else -half_track
                 elif key == "max_throttle":
                     self.max_throttle = item
                 elif key == "max_steer":

@@ -36,14 +36,22 @@ class AltPurePursuitController:
         self.generate_target_velocities()
         self.name = "pure_pursuit"
 
+        self.threshold_violated = False
+        self.alpha_threshold_max = np.deg2rad(50.0)
+        self.alpha_threshold_min = np.deg2rad(30.0)
+        self.guard_steer = 0.9
+
+
     # Pure Pursuit
-    def get_target_pos(self, world, path):
+    def get_target_pos(self, world, path, velocity = 1.0):
         xpos = world.pose[:2]
 
         pathlength = path.shape[0]
         search_window = pathlength//4
         xpos_x = xpos[0]
         xpos_y = xpos[1]
+
+        direction = 1 if velocity >= 0 else -1
 
         # remember to reset the indexes 
         if self.prev_index is None:
@@ -69,15 +77,15 @@ class AltPurePursuitController:
                 discriminant = math.sqrt(discriminant) 
                 t1 = (-b - discriminant) / (2 * a) 
                 t2 = (-b + discriminant) / (2 * a)
-                if (t1 >= 0 and t1 <= 1 and i + t1 > self.prev_index): #make sure we go forwards
-                    target_pos = currPoint + t1 * d  
+                for t in (t1, t2):
+                    idx = i + t
+                    if not (0 <= t <= 1 and idx > self.prev_index):
+                        continue
+
+                    target_pos = currPoint + t * d
+
                     self.prev_target_pos = target_pos
-                    self.prev_index = i + t1
-                    return target_pos
-                elif (t2 >= 0 and t2 <= 1 and i + t2 > self.prev_index):
-                    target_pos = currPoint + t2 * d
-                    self.prev_target_pos = target_pos
-                    self.prev_index = i + t2
+                    self.prev_index = idx
                     return target_pos
                 
         if math.ceil(self.prev_index) == pathlength-1:
@@ -105,22 +113,42 @@ class AltPurePursuitController:
     def calc_distance(self, xpos_x, xpos_y, path_x, path_y):
         return math.hypot(xpos_x - path_x, xpos_y - path_y)
 
-    def calculate_steering_angle(self, world, target_pos):
+    def calculate_steering_angle(self, world, target_pos, velocity):
         curr_pos = world.pose
         yaw = world.rpy[2]
         dx = target_pos[0] - curr_pos[0]
         dy = target_pos[1] - curr_pos[1]
         lookahead_angle = np.arctan2(dy, dx)
-        steer_rad = np.arctan2(2 * self.wheelbase * np.sin(lookahead_angle - yaw), self.lookahead_distance)
-        steer = np.clip(steer_rad/self.max_steering, -1., 1.)
-        return steer
+
+        direction = np.sign(velocity)
+        if direction == 0:
+            direction = 1.0
+
+        effective_yaw = yaw if direction > 0 else yaw + np.pi
+        effective_yaw = np.arctan2(np.sin(effective_yaw), np.cos(effective_yaw))
+        alpha = lookahead_angle - effective_yaw
+        alpha = np.arctan2(np.sin(alpha), np.cos(alpha))
+
+        guard_steer = self.guard_steer * np.sign(alpha) * direction
+
+        steer_rad = np.arctan2(2 * self.wheelbase * np.sin(alpha), self.lookahead_distance)
+        pp_steer = np.clip(steer_rad/self.max_steering, -1., 1.)*direction
+
+        if abs(alpha) > self.alpha_threshold_max:
+            self.threshold_violated = True
+            return guard_steer
+        elif self.alpha_threshold_min <= abs(alpha) <= self.alpha_threshold_max:
+            return guard_steer*0.5 if self.threshold_violated else pp_steer
+        else:
+            self.threshold_violated = False
+            return pp_steer
 
     #TODO: Fix Naming: This actually generates target throttles
     def generate_target_velocities(self):
         samples = self.totaltime // 100
         mean = self.lowervel + (self.uppervel - self.lowervel) * 0.5
         std_dev = (self.uppervel - self.lowervel) / 4
-        sampled_vels = np.random.normal(mean, std_dev, samples)
+        sampled_vels = np.random.normal(mean, abs(std_dev), samples)
 
         sampled_vels = np.clip(sampled_vels, self.lowervel, self.uppervel)
         x = np.linspace(0, self.totaltime, samples)
@@ -129,16 +157,16 @@ class AltPurePursuitController:
         target_velocities = spline(x_total)
 
         self._target_velocities = np.clip(target_velocities, self.lowervel, self.uppervel).copy()
-        assert np.all(self._target_velocities >= self.lowervel)
+        assert np.all(abs(self._target_velocities) >= abs(self.lowervel))
         
         # plt.plot(self._target_velocities)
         # plt.show()
   
     def get_control(self, t, world, path):
-        self.target_pos = self.get_target_pos(world, path)
         throttle = self.target_velocities[t]
-        assert np.all(self.target_velocities >= self.lowervel)
-        steer = self.calculate_steering_angle(world, self.target_pos)
+        self.target_pos = self.get_target_pos(world, path, throttle)
+        assert np.all(abs(self.target_velocities) >= abs(self.lowervel))
+        steer = self.calculate_steering_angle(world, self.target_pos, throttle)
 
         return [throttle, steer]
     

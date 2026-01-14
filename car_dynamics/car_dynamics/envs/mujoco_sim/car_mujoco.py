@@ -18,7 +18,7 @@ class MuJoCoCar(gym.Env):
         'delay': 0,
 
         'state_dim': 13,
-        'static_dim': 9,
+        'static_dim': 12,
         'action_dim_per_entity': 6,
         'num_entities': 5,
         'history_dim': 19,
@@ -39,10 +39,10 @@ class MuJoCoCar(gym.Env):
 
         if not self.wheel_configs:
             self.wheel_configs = [
-                {"pos":"0.1385  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
-                {"pos":"0.1385 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
-                {"pos":"-0.158  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
-                {"pos":"-0.158 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":[0.1385,  0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":[0.1385, -0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":[-0.158,  0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+                {"pos":[-0.158, -0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
             ]
         self.num_wheels = len(self.wheel_configs)
         
@@ -55,13 +55,6 @@ class MuJoCoCar(gym.Env):
         )
         
         self.observation_space = spaces.Dict({
-            # (N, self.num_entities, self.history_dim): History of dynamic states for [Root, W1, W2, W3, W4]
-            # State and Applied action at t = T-1, ..., T-N+1
-            "history": spaces.Box(
-                low=-np.inf, high=np.inf, 
-                shape=(self.history_length, self.num_entities, self.history_dim), 
-                dtype=np.float32
-            ),
             # State of entites at t=T
             "current_state": spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -75,7 +68,6 @@ class MuJoCoCar(gym.Env):
             )
         })
 
-        self.history_buffer = deque(maxlen=self.history_length)
         self.static_features = self._build_static_features()
         self.current_state = np.zeros((self.num_entities, self.state_dim), dtype=np.float32)
 
@@ -99,39 +91,19 @@ class MuJoCoCar(gym.Env):
         
         for i, config in enumerate(self.wheel_configs):
             idx = i + 1
-            features[idx, :6] = config["mask"]
-            features[idx, 6] = config["radius"]
-            features[idx, 7] = config["width"]
-            features[idx, 8] = config["mass"]
+            features[idx, 0:3] = config["pos"]
+            features[idx, 3:9] = config["mask"]
+            features[idx, 9] = config["radius"]
+            features[idx, 10] = config["width"]
+            features[idx, 11] = config["mass"]
 
         return features
 
-    def obs_state(self):        
-        history = np.array(self.history_buffer, dtype=np.float32)
-        
+    def obs_state(self):
         return {
-            "history": history,
-            "current_state": self.current_state,
-            "static_features": self.static_features
+            "current_state": self.current_state.copy(),
+            "static_features": self.static_features.copy()
         }
-    
-    def _record_history(self, action=None):
-        """
-        Append (self.num_entities, self.history_dim) shaped state matrix for all entities to history buffer
-        Row 0: Root State (World Frame)
-        Row 1~4: Wheel States (Root Relative Frame)
-        Each Col: 7 (Pose) + 6 (Twist) + 6 (Action) at t
-        
-        **Caution 1** This function should be called before action is applied
-        **Caution 2** history[t][pose, twist] are not a result of history[t][action]
-        """
-        if action is None:
-            action = np.zeros((self.num_entities, self.action_dim_per_entity), dtype=np.float32)
-        
-        state_matrix = self._get_current_state()
-        history_matrix = np.concatenate((state_matrix, action), axis=1)
-
-        self.history_buffer.append(history_matrix)
 
     def _get_current_state(self):
         state_matrix = np.zeros((self.num_entities, self.state_dim), dtype=np.float32)
@@ -169,11 +141,7 @@ class MuJoCoCar(gym.Env):
         for _ in range(self.delay):
             self.action_buffer.append(np.array([0., 0.], dtype=np.float32))
         
-        self.history_buffer.clear()
         self.current_state = self._get_current_state()
-
-        for _ in range(self.history_length):
-            self._record_history()
 
         return self.obs_state()
 
@@ -191,16 +159,15 @@ class MuJoCoCar(gym.Env):
         num_steps = int(self.dt / self.world.dt)
 
         # scale acceleration command 
-        throttle = action[:, 4] * self.world.max_throttle #scale it to real values
-        steer = action[:, 5] * self.world.max_steer  + self.world.steer_bias # scale it to real values
+        # throttle = action[:, 4] * self.world.max_throttle #scale it to real values
+        # steer = action[:, 5] * self.world.max_steer  + self.world.steer_bias # scale it to real values
         for _ in range(num_steps):
             #calculate the target vel from throttle and previous velocity.
-            self.target_velocity = throttle * self.world.dt + self.target_velocity
-            action[:, 4] = self.target_velocity
-            action[:, 5] = steer
-            action[3:5, 5] *= -1
+            # self.target_velocity = throttle * self.world.dt + self.target_velocity
+            # action[:, 4] = self.target_velocity
+            # action[:, 5] = steer
+            # action[3:5, 5] *= -1
 
-            self._record_history(action)
             self.world.step(action)
             self.current_state = self._get_current_state()
 
@@ -221,13 +188,30 @@ class MuJoCoCar(gym.Env):
         if mode == 'human':
             self.world.render()
 
-    def change_parameters(self, car_params: dict):
-        self.world.change_parameters(car_params)
+    def change_parameters(self, car_params: dict|None = None):
+        if car_params:
+            self.world.change_parameters(car_params)
+            return car_params
+        params = {}
+        
+        params["mass"] = self.generate_new_mass()
+        params["com"] = self.generate_new_com()        
+        params["friction"] = self.generate_new_friction() 
+        params["wheel_parameters"] = self.generate_new_wheel_parameters()
+        params["wheel_base"] = self.generate_new_wheel_base()
+        params["wheel_track"] = self.generate_new_wheel_track()
+        params["max_throttle"] = self.generate_new_max_throttle()        
+        # params["delay"] = self.generate_new_delay()        
+        params["max_steer"] = self.generate_new_max_steering()        
+        params["steer_bias"] = self.generate_new_steering_bias()
+        self.world.change_parameters(params)
+        return params
 
     # generate a new mass
     def generate_new_mass(self):   
         # print("[Warn] Car Mass Generation Not Defined for Simulator Type")
-        default_mass = 3.794137 # base mujoco mass
+        # default_mass = 3.794137 # base mujoco mass
+        default_mass = self.world.model.body_mass[self.world.root_id].copy()
         
         lower = default_mass * 0.7
         upper = default_mass * 1.3
@@ -237,7 +221,9 @@ class MuJoCoCar(gym.Env):
 
     def generate_new_com(self):
         # print("[Warn] COM Generation Not Defined for Simulator Type")
-        default_com = np.array([-0.02323112, -0.00007926,  0.09058852]) # base mujoco COM
+        # default_com = np.array([-0.02323112, -0.00007926,  0.09058852]) # base mujoco COM
+        default_com = self.world.model.body_ipos[self.world.root_id].copy()
+
         lower = default_com - 0.05 #5 cm range
         upper = default_com + 0.05
 
@@ -255,6 +241,34 @@ class MuJoCoCar(gym.Env):
         new_friction = np.array([friction, 0.005, 0.0001]) #static, torsional, rolling         
 
         return new_friction
+    
+    def generate_new_wheel_parameters(self):
+        default_radius, default_width = self.world.model.geom_size[self.world.rim_geom_ids[0]]
+        default_mass = self.world.model.body_mass[self.world.rim_body_ids[0]]
+
+        radius = np.random.normal(default_radius, default_radius/4, 1)
+        width = np.random.normal(default_width, default_width/4, 1)
+        mass = np.random.normal(default_mass, default_mass/4, 1)
+        return [radius, width, mass]
+    
+    def generate_new_wheel_base(self):
+        """ Assume Four wheels with FL, FR, RL, RR order"""
+        default_front = self.world.model.body_pos[self.world.knuckle_body_ids[0]][0]
+        default_rear = self.world.model.body_pos[self.world.knuckle_body_ids[2]][0]
+
+        front = np.random.normal(default_front, default_front/4, 1)
+        rear = np.random.normal(default_rear, default_rear/4, 1)
+        return [front, rear]
+    
+    def generate_new_wheel_track(self):
+        """ Assume Four wheels with FL, FR, RL, RR order"""
+        default_track = (
+            self.world.model.body_pos[self.world.knuckle_body_ids[0]][1] - 
+            self.world.model.body_pos[self.world.knuckle_body_ids[1]][1]
+        )
+
+        track = np.random.normal(default_track, default_track/4, 1)
+        return track
 
     def generate_new_delay(self):
         lower = 0
@@ -290,5 +304,65 @@ class MuJoCoCar(gym.Env):
         print("[Warn] Slope Generation Not Defined for Simulator Type")
         pass
     
-    
-    
+    def generate_new_actuation_config(self):
+        """
+        Returns:
+            mask: dict
+                {
+                'FL': [x, y, z, camber, throttle, steering],
+                'FR': [x, y, z, camber, throttle, steering],
+                'RL': [x, y, z, camber, throttle, steering],
+                'RR': [x, y, z, camber, throttle, steering],
+                }
+        """
+        wheels = ["FL", "FR", "RL", "RR"]
+
+        # --- 1. Linear motions (shared across all wheels) ---
+        x_move = np.random.choice([True, False])
+        y_move = np.random.choice([True, False])
+        z_move = np.random.choice([True, False])
+
+        # --- 2. Drivetrain (throttle) ---
+        drivetrain = np.random.choice(["4WD", "FWD", "RWD"])
+
+        if drivetrain == "4WD":
+            throttle = {"FL": True, "FR": True, "RL": True, "RR": True}
+        elif drivetrain == "FWD":
+            throttle = {"FL": True, "FR": True, "RL": False, "RR": False}
+        else:  # RWD
+            throttle = {"FL": False, "FR": False, "RL": True, "RR": True}
+
+        # --- 3. Steering ---
+        steering_mode = np.random.choice(["4WS", "FWS", "RWS"])
+
+        if steering_mode == "4WS":
+            steering = {"FL": True, "FR": True, "RL": True, "RR": True}
+        elif steering_mode == "FWS":
+            steering = {"FL": True, "FR": True, "RL": False, "RR": False}
+        else:  # RWS
+            steering = {"FL": False, "FR": False, "RL": True, "RR": True}
+
+        # --- 4. Camber ---
+        front_camber = np.random.choice([True, False])
+        rear_camber = np.random.choice([True, False])
+
+        camber = {
+            "FL": front_camber,
+            "FR": front_camber,
+            "RL": rear_camber,
+            "RR": rear_camber,
+        }
+
+        # --- 5. Assemble mask ---
+        mask = {}
+        for w in wheels:
+            mask[w] = [
+                x_move,          # x linear
+                y_move,          # y linear
+                z_move,          # z linear
+                camber[w],       # camber
+                throttle[w],     # throttle
+                steering[w],     # steering
+            ]
+
+        return mask

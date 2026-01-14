@@ -280,13 +280,15 @@ class MPPIController(BaseController):
         diff_vel = state_step[:, 0, 7] - goal[3]
 
         diff_throttle = jnp.linalg.norm(action_step[:, 1:, 4] - prev_action[:, 1:, 4], axis=1)
+        diff_steering = jnp.linalg.norm(action_step[:, 1:, 5] - prev_action[:, 1:, 5], axis=1)
         
         reward_pos_err = -dist_pos ** 2
         reward_psi = -diff_psi ** 2
         reward_vel = -diff_vel ** 2
         reward_throttle = - diff_throttle ** 2
-        reward = reward_pos_err * 5.0 + reward_psi * 5.0 + reward_vel * 1. + reward_throttle * 0.0
-        reward *= (self.params.discount ** step)
+        reward_steering = - diff_steering ** 2
+        reward = reward_pos_err*5.0 + reward_psi*5.0 + reward_vel*1. + reward_throttle*1.0 + reward_steering*1.0
+        # reward *= (self.params.discount ** step)
         return (step + 1, action_step), reward
     
     @partial(jax.jit, static_argnums=(0,))
@@ -340,7 +342,7 @@ class MPPIController(BaseController):
         )
     
     @partial(jax.jit, static_argnums=(0,))
-    def debug_rollout(self, key, obs, a_list, running_params: MPPIRunningParams, dynamic_params_tuple):
+    def debug_rollout(self, key, obs, a_list, running_params: MPPIRunningParams, static_features):
         """
         Perform a debug rollout to visualize the optimized trajectory.
 
@@ -366,12 +368,12 @@ class MPPIController(BaseController):
             self.params.num_actions
         )
         key, key2 = jax.random.split(key, 2)
-        optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, dynamic_params_tuple, self.params.fix_history))[:, 0]
+        optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, static_features, self.params.fix_history))[:, 0]
         return optim_traj
         
         
         
-    @partial(jax.jit, static_argnums=(0,))
+    # @partial(jax.jit, static_argnums=(0,))
     def __call__(
         self,
         obs,
@@ -420,8 +422,6 @@ class MPPIController(BaseController):
             a_mean_waypoint = a_mean_waypoint.at[:, d].set(
                 self.u2node(running_params.a_mean_flattened[:, d])
             )
-        # a_mean_waypoint = a_mean_waypoint.at[:, 0].set(self.u2node(running_params.a_mean[:, 0]))
-        # a_mean_waypoint = a_mean_waypoint.at[:, 1].set(self.u2node(running_params.a_mean[:, 1]))
         
         
         a_cov_waypoint = running_params.a_cov_flattened[::self.params.num_intermediate]
@@ -436,8 +436,6 @@ class MPPIController(BaseController):
             a_sampled_flattened = a_sampled_flattened.at[:, :, d].set(
                 self.node2u_vmap(a_sampled_waypoint[:, :, d])
             )
-        # a_sampled = a_sampled.at[:, :, 0].set(self.node2u_vmap(a_sampled_waypoint[:, :, 0]))
-        # a_sampled = a_sampled.at[:, :, 1].set(self.node2u_vmap(a_sampled_waypoint[:, :, 1]))
         
 
         a_sampled_raw = self.normalize_action(a_sampled_flattened)
@@ -445,16 +443,15 @@ class MPPIController(BaseController):
         a_sampled_flattened.at[:, :self.params.delay, :].set(running_params.prev_a_flattened)
         a_sampled_flattened = a_sampled_flattened.at[:, self.params.delay:, :].set(a_sampled_raw)
         
-        state_init = self.state_init_buf.copy()
-        for i_ in range(self.params.num_obs):
-            state_init = state_init.at[i_].set(state_init[i_] * obs[i_])
+        state_init = obs
         
         ## Note: 2. Simulating rollouts using the dynamics model
         self_key, key2 = jax.random.split(self_key, 2)
         a_sampled = a_sampled_flattened.reshape(*a_sampled_flattened.shape[:2], self.params.num_entities, self.params.num_actions)
+        state_init[:, -1, :, self.params.state_dim:] = a_sampled[:, 0, :, :]
         state_list = self._get_rollout(key2, state_init, running_params.state_hist, a_sampled, static_features, self.params.fix_history)   # List
 
-        reward_rollout = self.get_reward(state_list, a_sampled, goal_list)
+        reward_rollout = self.get_reward(state_list, a_sampled, goal_list, state_init[:, -2, :, :])
         cost_rollout = -reward_rollout
         cost_exp = jnp.exp(-(cost_rollout - jnp.min(cost_rollout)) / self.params.lam)
         weight = cost_exp / cost_exp.sum()
@@ -506,6 +503,6 @@ class MPPIController(BaseController):
             ### Note: Need to comment out the @jax.jit decorator for the following two lines to visualize the history
             #  'history': running_params.state_hist,
             #  'all_traj': state_list[:, best_100_idx],
-        } 
+        }
         
         return u.reshape(self.params.num_entities, self.params.num_actions),  new_running_params,  info_dict

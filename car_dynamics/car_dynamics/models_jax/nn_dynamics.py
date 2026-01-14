@@ -7,13 +7,15 @@ import orbax
 import optax
 import numpy as np
 from car_foundation import CAR_FOUNDATION_MODEL_DIR
-from car_foundation.jax_models import JaxDynamicsPredictor
+from car_foundation.jax_models import JaxDynamicsPredictor, TmpMLP
 from termcolor import colored
 from flax.training import orbax_utils, train_state
 from functools import partial
 import torch
 
 from car_foundation.torch_models import DynamicsPredictor
+from car_foundation.utils import differentiate_state, integrate_state
+from car_foundation.data_config import MujocoDataConfig
 from car_dynamics.envs.mujoco_sim.car_mujoco import MuJoCoCar
 
 def align_yaw(yaw_1, yaw_2):
@@ -42,23 +44,25 @@ class DynamicsJax:
         # print("input_std", self.input_std)
 
     def load_jax_model(self):
-        self.model = model = JaxDynamicsPredictor(
+        self.model = model = TmpMLP(
             model_dim=self.params['model_dim'],
-            output_dim=self.params['state_dim']
+            state_dim=self.params['state_dim'],
+            num_heads=self.params['num_heads'],
+            num_layers=self.params['num_layers']
         )
         dummy_hist = jnp.ones((1, self.params['history_length'], self.params['num_entities'], self.params['history_dim']))
         dummy_static = jnp.ones((1, self.params['num_entities'], self.params['static_dim']))
+        dummy_pred_input = jnp.ones((1, 1, self.params['num_entities'], self.params['action_dim']))
+
 
         self.key, key2 = jax.random.split(self.key, 2)
-        self.var = self.model.init(key2, dummy_hist, dummy_static)
+        self.var = self.model.init(key2, dummy_hist, dummy_static, dummy_pred_input)
         params = self.var['params']
 
-        from car_foundation.train_jax_dynamics_predictor import TrainState
-        self.model_state = TrainState.create(
+        self.model_state = train_state.TrainState.create(
             apply_fn=model.apply,
             params=params,
-            tx=optax.adamw(1e-4),
-            rng=self.key
+            tx=optax.adamw(1e-4)
         )
 
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -73,10 +77,7 @@ class DynamicsJax:
 
         restore_target = {
             'model': self.model_state,
-            'config': {
-                'target_scale': 100.0,
-                'dims': (self.params['history_dim'], self.params['static_dim'])
-            }
+            'description': 'Inference future states (B,T,E,X) without normalizing'
         }
 
         self.ckpt = manager.restore(
@@ -87,54 +88,28 @@ class DynamicsJax:
     @partial(jax.jit, static_argnums=(0,))
     def step(self, key, history: jax.Array, state: jax.Array, action: jax.Array, static_features: jax.Array):
         """
-        
-        History: (Batch, L, E, H)
+        History: (Batch, T_history, E, H)
         State: (Batch, E, X)
         Action: (Batch, T_future, E, A)
         """
         st_nn_dyn = time.time()
+        key, key2 = jax.random.split(key, 2)
 
-        action_seq = jnp.swapaxes(action, 0, 1) # (T_future, Batch, E, A)
-        L = history.shape[1]
-        history_expanded = jnp.concatenate(
-            [history, jnp.zeros((history.shape[0], action_seq.shape[0], *history.shape[2:] ))],
-            axis=1
-        ) # (Batch, L+T_future, E, H)
+        _, deltas = differentiate_state(history)
 
-        def scan_step(carry, action_t):
-            key, history, history_expanded, state, index = carry
-
-            # Update history
-            current_history = jnp.concatenate(
-                [state, action_t], axis=-1
-            )  # (Batch, E, H)
-
-            history_expanded.at[:, index, :, :].set(current_history)
-
-            history = jnp.concatenate(
-                [history[:, 1:], current_history[:, None]],
-                axis=1
-            )
-
-            key, subkey = jax.random.split(key)
-
-            pred_delta = self.model_state.apply_fn(
-                {'params': self.model_state.params},
-                history,
-                static_features,
-                rngs=subkey,
-            ) / self.ckpt['config']['target_scale']
-
-            state = state + pred_delta
-
-            return (key, history, history_expanded, state, index+1), None
-
-        (key, history, history_expanded, state, index), _ = jax.lax.scan(
-            scan_step,
-            (key, history, history_expanded, state, L),
-            action_seq,
+        y_pred_delta = self.model_state.apply_fn(
+            {'params': self.model_state.params},
+            deltas,
+            static_features,
+            action,
+            rngs=key2,
+            deterministic=True
         )
+
+        current_state = history[:, -1, :, :MujocoDataConfig.HISTORY_STATE_END]
+
+        y_pred = integrate_state(current_state, y_pred_delta)
             
         print("NN Inference Time", time.time() - st_nn_dyn)
-        return history_expanded[:,-action.shape[1]:, :,:self.params['state_dim']]
+        return y_pred
         
