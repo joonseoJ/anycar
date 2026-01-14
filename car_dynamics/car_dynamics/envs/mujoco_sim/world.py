@@ -83,13 +83,16 @@ def generate_xml(wheel_configs) -> str:
                     <geom contype="0" conaffinity="0" group="1" rgba="1 1 1 1"/>
                 </default>
                 <default class="p_x">
-                    <joint type="slide" axis="1 0 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                    <joint type="slide" axis="1 0 0" limited="true" range="-0.1 0.1" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
                 <default class="p_y">
-                    <joint type="slide" axis="0 1 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                    <joint type="slide" axis="0 1 0" limited="true" range="-0.1 0.1" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
-                <default class="p_z">
-                    <joint type="slide" axis="0 0 1" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-1 1"/>
+                <default class="suspension">
+                    <joint type="slide" axis="0 0 1" limited="true" range="-0.05 0.05" 
+                        stiffness="1500" damping="100" frictionloss="0.1" armature="0.01"/>
                 </default>
                 <default class="camber">
                     <joint type="hinge" axis="1 0 0" limited="true" frictionloss="0.01" damping="0.001" armature="0.0002" range="-0.1 0.1"/>
@@ -107,7 +110,7 @@ def generate_xml(wheel_configs) -> str:
                 <geom type="plane" size="300 300 .01" material="grid"/>
 
                 <body name="root" pos="0.0 0.0 0.0" euler="0.0 0.0 0.0">
-                    <camera name="track" mode="trackcom" pos="0 0 3.0" xyaxes="1 0 0 0 1 0"/>
+                    <camera name="track" mode="trackcom" pos="0 -2 2" xyaxes="1 0 0 0 0.7 0.7"/>
                     <joint type="free"/>
                     <site name="root_site" pos="0.0 0.0 0.0"/>
                     <geom name="root" type="mesh" mesh="chassis" pos="0 0 0.094655"/>
@@ -129,10 +132,10 @@ def generate_xml(wheel_configs) -> str:
                 mjcf += f"""
                         <joint class="p_y" name="p_y_{i}"/>
                         """
-            if wheel_config["mask"][2]:
-                mjcf += f"""
-                        <joint class="p_z" name="p_z_{i}"/>
-                        """
+            # if wheel_config["mask"][2]:
+            mjcf += f"""
+                    <joint class="suspension" name="suspension_{i}"/>
+                    """
             if wheel_config["mask"][3]:
                 mjcf += f"""
                         <joint class="camber" name="camber_{i}"/>
@@ -144,7 +147,7 @@ def generate_xml(wheel_configs) -> str:
             mjcf += f"""
                         <body name="wheel_{i}_rim" pos="0 0 0" zaxis="0 1 0">
                             <joint class="throttle" name="throttle_{i}"/>
-                            <geom type="cylinder" size="{wheel_config["radius"]} {wheel_config["width"]}" mass="{wheel_config["mass"]}" rgba=".5 .5 1 1" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
+                            <geom name="wheel_{i}_rim" type="cylinder" size="{wheel_config["radius"]} {wheel_config["width"]}" mass="{wheel_config["mass"]}" rgba=".5 .5 1 1" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
                             <site name="wheel_{i}_rim_site" pos="0 0 0" type="box" size=".006 .03 .015" rgba="1 0 0 1"/>
                         </body>
                     </body>
@@ -160,15 +163,15 @@ def generate_xml(wheel_configs) -> str:
         for i, wheel_config in enumerate(wheel_configs):
             if wheel_config["mask"][0]:
                 mjcf += f"""
-                        <position class="p_x" kp="25.0" name="p_x_{i}" joint="p_x_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="p_x_{i}" joint="p_x_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][1]:
                 mjcf += f"""
-                        <position class="p_y" kp="25.0" name="p_y_{i}" joint="p_y_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="p_y_{i}" joint="p_y_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][2]:
                 mjcf += f"""
-                        <position class="p_z" kp="25.0" name="p_z_{i}" joint="p_z_{i}" ctrlrange="-1 1" ctrllimited="true" />
+                        <motor name="sus_{i}" joint="suspension_{i}" gear="1" ctrllimited="true" ctrlrange="-200 200"/>
                         """
             if wheel_config["mask"][3]:
                 mjcf += f"""
@@ -249,6 +252,16 @@ class World:
         self.warmup_steps = int(2. / self.timestep)
 
         self.root_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "root")
+        self.root_geom_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, "root")
+        self.num_wheels = len(self.wheel_configs)
+        
+        self.knuckle_body_ids = []
+        self.rim_body_ids = []
+        self.rim_geom_ids = []
+        for i in range(self.num_wheels):
+            self.knuckle_body_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, f"wheel_{i}_knuckle"))
+            self.rim_body_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, f"wheel_{i}_rim"))
+            self.rim_geom_ids.append(mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, f"wheel_{i}_rim"))
         
         
     def reset(self, ):
@@ -414,15 +427,27 @@ class World:
         if change:
             for key, item in parameters.items():
                 if key == "mass":
-                    self.model.body_mass[1] = item
+                    self.model.body_mass[self.root_id] = item
                 elif key == "com":
-                    self.model.body_ipos[1] = item
+                    self.model.body_ipos[self.root_id] = item
                 elif key == "friction":
-                    self.model.geom_friction[2] = item
-                    self.model.geom_friction[3] = item
-                    self.model.geom_friction[4] = item
-                    self.model.geom_friction[5] = item
-                    self.model.geom_friction[0] = item
+                    self.model.geom_friction[self.root_geom_id] = item
+                    for geom_id in self.rim_geom_ids:
+                        self.model.geom_friction[geom_id] = item
+                elif key == "wheel_parameters":
+                    radius, width, mass = item
+                    for geom_id in self.rim_geom_ids:
+                        self.model.geom_size[geom_id][:2] = [radius, width]
+                    for body_id in self.rim_body_ids:
+                        self.model.body_mass[body_id] = mass
+                elif key == "wheel_base":
+                    front, rear = item
+                    for i, body_id in enumerate(self.knuckle_body_ids):
+                        self.model.body_pos[body_id][0] = front if i < 2 else rear
+                elif key == "wheel_track":
+                    half_track = item/2.0
+                    for i, body_id in enumerate(self.knuckle_body_ids):
+                        self.model.body_pos[body_id][1] = half_track if i %2==0 else -half_track
                 elif key == "max_throttle":
                     self.max_throttle = item
                 elif key == "max_steer":

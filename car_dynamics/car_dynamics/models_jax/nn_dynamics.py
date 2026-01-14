@@ -44,21 +44,23 @@ class DynamicsJax:
     def load_jax_model(self):
         self.model = model = JaxDynamicsPredictor(
             model_dim=self.params['model_dim'],
-            output_dim=self.params['state_dim']
+            state_dim=self.params['state_dim'],
+            num_heads=self.params['num_heads'],
+            num_layers=self.params['num_layers']
         )
         dummy_hist = jnp.ones((1, self.params['history_length'], self.params['num_entities'], self.params['history_dim']))
         dummy_static = jnp.ones((1, self.params['num_entities'], self.params['static_dim']))
+        dummy_pred_input = jnp.ones((1, 1, self.params['num_entities'], self.params['action_dim']))
+
 
         self.key, key2 = jax.random.split(self.key, 2)
-        self.var = self.model.init(key2, dummy_hist, dummy_static)
+        self.var = self.model.init(key2, dummy_hist, dummy_static, dummy_pred_input)
         params = self.var['params']
 
-        from car_foundation.train_jax_dynamics_predictor import TrainState
-        self.model_state = TrainState.create(
+        self.model_state = train_state.TrainState.create(
             apply_fn=model.apply,
             params=params,
-            tx=optax.adamw(1e-4),
-            rng=self.key
+            tx=optax.adamw(1e-4)
         )
 
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -73,10 +75,7 @@ class DynamicsJax:
 
         restore_target = {
             'model': self.model_state,
-            'config': {
-                'target_scale': 100.0,
-                'dims': (self.params['history_dim'], self.params['static_dim'])
-            }
+            'description': 'Inference future states (B,T,E,X) without normalizing'
         }
 
         self.ckpt = manager.restore(
@@ -93,48 +92,17 @@ class DynamicsJax:
         Action: (Batch, T_future, E, A)
         """
         st_nn_dyn = time.time()
+        key, key2 = jax.random.split(key, 2)
 
-        action_seq = jnp.swapaxes(action, 0, 1) # (T_future, Batch, E, A)
-        L = history.shape[1]
-        history_expanded = jnp.concatenate(
-            [history, jnp.zeros((history.shape[0], action_seq.shape[0], *history.shape[2:] ))],
-            axis=1
-        ) # (Batch, L+T_future, E, H)
-
-        def scan_step(carry, action_t):
-            key, history, history_expanded, state, index = carry
-
-            # Update history
-            current_history = jnp.concatenate(
-                [state, action_t], axis=-1
-            )  # (Batch, E, H)
-
-            history_expanded.at[:, index, :, :].set(current_history)
-
-            history = jnp.concatenate(
-                [history[:, 1:], current_history[:, None]],
-                axis=1
-            )
-
-            key, subkey = jax.random.split(key)
-
-            pred_delta = self.model_state.apply_fn(
-                {'params': self.model_state.params},
-                history,
-                static_features,
-                rngs=subkey,
-            ) / self.ckpt['config']['target_scale']
-
-            state = state + pred_delta
-
-            return (key, history, history_expanded, state, index+1), None
-
-        (key, history, history_expanded, state, index), _ = jax.lax.scan(
-            scan_step,
-            (key, history, history_expanded, state, L),
-            action_seq,
+        y_pred = self.model_state.apply_fn(
+            {'params': self.model_state.params},
+            history,
+            static_features,
+            action,
+            rngs=key2,
+            deterministic=True
         )
             
         print("NN Inference Time", time.time() - st_nn_dyn)
-        return history_expanded[:,-action.shape[1]:, :,:self.params['state_dim']]
+        return y_pred
         

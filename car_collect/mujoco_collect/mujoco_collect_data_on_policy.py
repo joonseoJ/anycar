@@ -50,7 +50,15 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
     tic = time.time()
 
     dataset = CarDataset()
-    env = MuJoCoCar({'is_render': render}) # create the simulation environment
+    env = MuJoCoCar({
+        'is_render': render,
+        'wheel_configs': [
+            {"pos":"0.1385  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+            {"pos":"0.1385 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+            {"pos":"-0.158  0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+            {"pos":"-0.158 -0.115  0.0488",  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
+        ]
+    })
     env.reset()
 
     # set the simulator
@@ -74,7 +82,7 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
     print("Car Params", dataset.car_params)
 
     #choose to change parameters or not
-    env.world.change_parameters(dataset.car_params)
+    # env.world.change_parameters(dataset.car_params)
 
     direction = np.random.choice([-1, 1])
     scale = int(np.random.uniform(1, 5))
@@ -127,9 +135,10 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
             state, 
             target_pos_tensor, 
             mppi_running_params, 
-            static_features[:,:6], 
+            static_features, 
         )
         mppi_running_params = mppi.feed_hist(mppi_running_params, state, action)
+        action = action.at[:,4].set(action[:,4]*-1)
         
         obs, reward, done, info = env.step(np.array(action))
 
@@ -180,8 +189,8 @@ if __name__ == "__main__":
     debug_plots = False
     simend = 20000
     episodes = 100
-    data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
-    resume_model_name = "2026-01-08T15:48:33.113-model_checkpoint"
+    data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_on_policy")
+    resume_model_name = "2026-01-14T11:14:00.296-model_checkpoint"
     resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
     os.makedirs(data_dir, exist_ok=True)
 
@@ -190,13 +199,15 @@ if __name__ == "__main__":
     jax_key, key2 = jax.random.split(jax_key)
     dynamics = DynamicsJax({
         'model_path': resume_model_folder_path,
-        'model_dim': 128,
+        'model_dim': 64,
         'state_dim': 13,
         'action_dim': 6,
-        'static_dim': 6,
+        'static_dim': 9,
         'history_dim': 19,
         'history_length': 100,
         'num_entities': 5,
+        'num_heads': 4,
+        'num_layers': 2
     })
     mppi_rollout_fn = rollout_fn_jax(dynamics)
     mppi = MPPIController(

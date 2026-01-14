@@ -19,13 +19,26 @@ from car_dynamics import MUJOCO_MODEL_DIR
 
 from car_dynamics.envs.mujoco_sim.car_mujoco import MuJoCoCar
 from car_dynamics.controllers_torch import AltPurePursuitController, RandWalkController
+from car_dynamics.models_jax import DynamicsJax
+from car_foundation import CAR_FOUNDATION_MODEL_DIR
+
+import jax
+import jax.numpy as jnp
 
 import faulthandler
 faulthandler.enable()
 
-def log_data(dataset, state, action):
-    dataset.data_logs["state"].append(state)
-    dataset.data_logs["action"].append(action)
+def visualize_diff(diff):
+    plt.figure()
+    plt.imshow(diff)
+    plt.colorbar()
+    plt.title("Difference between NumPy and JAX")
+    plt.xlabel("Column")
+    plt.ylabel("Row")
+    plt.show()
+
+    print("max diff:", diff.max())
+    print("mean diff:", diff.mean())
 
 def get_rollout_fn(use_ray):
     if use_ray:
@@ -38,7 +51,7 @@ def rollout(id, simend, render, debug_plots, datadir):
 
     dataset = CarDataset()
     env = MuJoCoCar({'is_render': render}) # create the simulation environment
-    env.reset()
+    obs = env.reset()
 
     # set the simulator
     dataset.car_params["sim"] = env.name
@@ -95,11 +108,28 @@ def rollout(id, simend, render, debug_plots, datadir):
     clipped = 0
     actions = []
 
-    obs = env.reset()
-    state = obs['current_state']
-    static_features = obs['static_features']
-    dataset.car_params["static_features"] = static_features
-    for t in tqdm(range(simend)):
+
+    resume_model_name = "2026-01-14T11:14:00.296-model_checkpoint"
+    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
+    dynamics = DynamicsJax({
+        'model_path': resume_model_folder_path,
+        'model_dim': 128,
+        'state_dim': 13,
+        'action_dim': 6,
+        'static_dim': 9,
+        'history_dim': 19,
+        'history_length': 100,
+        'num_entities': 5,
+        'num_heads': 4,
+        'num_layers': 2
+    })
+    jax_key = jax.random.PRNGKey(0)
+    for t in range(simend):
+        if t == 0:
+            state = obs['current_state']
+            history = jnp.tile(state[None, None, :, :], (1, dynamics.params['history_length'], 1, 1))
+            history = jnp.concatenate([history, jnp.zeros((*history.shape[:3], 6))], axis=-1)
+                
 
         action = controller.get_control(t, env.world, trajectory)
         if controller.name == "pure_pursuit":
@@ -120,46 +150,37 @@ def rollout(id, simend, render, debug_plots, datadir):
         action_matrix[:,5] = action[1]
         #TODO Fix this, the action is getting clipped like 25% of the time
         action_matrix = np.clip(action_matrix, env.action_space.low, env.action_space.high)
-        log_data(dataset, state, action_matrix)
-
         # actions.append(action[0]) 
         obs, reward, done, info = env.step(action_matrix)
         state = obs['current_state']
 
+
+        jax_key, key2 = jax.random.split(jax_key)
+        state_nn = dynamics.model_state.apply_fn(
+            {'params': dynamics.model_state.params},
+            history,
+            obs['static_features'][None],
+            action_matrix[None,None],
+            rngs=key2,
+        )
+        state_nn = np.array(state_nn[0, 0,:])
+        diff = np.abs(state - state_nn)
+
+        visualize_diff(diff)
 
         # check if the robot screwed up
         #TODO Fix when adding slope changes to the world.
         if np.abs(env.world.rpy[0]) > 0.05 or np.abs(env.world.rpy[1]) > 0.05:
             is_terminate = True
             break
-    
-    if not is_terminate:
-        # dataset.data_logs["lap_end"][-1] = 1 
-        now = datetime.datetime.now().isoformat(timespec='milliseconds')
-        file_name = "log_" + str(id) + '_' + str(now) + ".pkl"
-        filepath = os.path.join(datadir, file_name)
-        
-        for key, value in dataset.data_logs.items():
-            dataset.data_logs[key] = np.array(value)
-
-        with open(filepath, 'wb') as outp: 
-            pickle.dump(dataset, outp, pickle.HIGHEST_PROTOCOL)
-
-        print("Saved Data to:", filepath)
-
-        # if debug_plots:
-        #     actions = np.array(actions)
-        #     print(actions.shape)
-        #     plt.plot(actions, label = "actual command")
-        #     # plt.plot(actions[:, 1], label = "steering")
-        #     # plt.plot(ppcontrol.target_velocities, label="targetvel")
-        #     plt.legend()
-        #     plt.show()
-        #     plt.plot(dataset.data_logs["traj_x"], dataset.data_logs["traj_y"], label='Trajectory')
-        #     plt.plot(dataset.data_logs["xpos_x"], dataset.data_logs["xpos_y"], linestyle = "dashed", label='Car Position')
-        #     plt.show()
-        
-        dataset.reset_logs()
+   
+        current_history = jnp.concatenate(
+            [state, action_matrix], axis=-1
+        )
+        history = jnp.concatenate(
+            [history[:, 1:], current_history[None, None, :, :]],
+            axis=1
+        )
             
     print("Simulation Complete!")
     print("Total Timesteps: ", simend + 1)
@@ -168,10 +189,10 @@ def rollout(id, simend, render, debug_plots, datadir):
 
 if __name__ == "__main__":
 
-    render = False
+    render = True
     debug_plots = False
     simend = 20000
-    episodes = 50
+    episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_sim_debugging")
     os.makedirs(data_dir, exist_ok=True)
 

@@ -51,6 +51,7 @@ class JaxSinusoidalPositionalEncoding(nn.Module):
 
         return x + pe
 
+
 class JaxAxialAttentionBlock(nn.Module):
     """
     Time-Axis Attention -> Entity-Axis Attention -> MLP
@@ -153,17 +154,104 @@ class JaxAxialTransformerEncoder(nn.Module):
             )(x, deterministic=deterministic)
 
         x = nn.LayerNorm()(x)
-
-        # --- Output Aggregation ---
-        # Take the state at the LAST time step
-        # x shape: (B, L, E, D_MODEL) -> Take index -1 -> (B, E, D_MODEL)
-        representation = x[:, -1, :, :]
         
-        # Note: PyTorch implementation flattened output at the end of forward in DynamicsPredictor?
-        # The encoder in PyTorch returned flattened (B, E*D_MODEL) in the docstring comment, 
-        # but the logic returned representation as is, and DynamicsPredictor head handled it.
-        # We return (B, E, D_MODEL) here to match the logical flow.
-        return representation
+        return x
+
+
+class JaxAxialDecoderBlock(nn.Module):
+    """
+    Time Self-Attention (causal)
+    → Time Cross-Attention (encoder memory)
+    → Entity Attention
+    → MLP
+    """
+    d_model: int
+    num_heads: int
+    dropout_rate: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, memory, deterministic: bool = True):
+        """
+        x:      (B, T_pred, E, D)
+        memory: (B, H, E, D)
+        """
+        B, T, E, D = x.shape
+        _, H, _, _ = memory.shape
+
+        # =====================================================
+        # 1. Time Self-Attention (Decoder causal)
+        # =====================================================
+        x_time = x.transpose((0, 2, 1, 3)).reshape((B * E, T, D))
+
+        # causal mask: (T, T)
+        causal_mask = jnp.tril(jnp.ones((T, T)))
+
+        attn_out = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            dropout_rate=self.dropout_rate,
+        )(
+            x_time,
+            x_time,
+            mask=causal_mask,
+            deterministic=deterministic,
+        )
+
+        x_time = x_time + attn_out
+        x = x_time.reshape((B, E, T, D)).transpose((0, 2, 1, 3))
+        x = nn.LayerNorm()(x)
+
+        # =====================================================
+        # 2. Time Cross-Attention (Decoder → Encoder)
+        # =====================================================
+        q = x.transpose((0, 2, 1, 3)).reshape((B * E, T, D))
+        kv = memory.transpose((0, 2, 1, 3)).reshape((B * E, H, D))
+
+        attn_out = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            dropout_rate=self.dropout_rate,
+        )(
+            q,
+            kv,
+            deterministic=deterministic,
+        )
+
+        q = q + attn_out
+        x = q.reshape((B, E, T, D)).transpose((0, 2, 1, 3))
+        x = nn.LayerNorm()(x)
+
+        # =====================================================
+        # 3. Entity Axis Attention
+        # =====================================================
+        x_entity = x.reshape((B * T, E, D))
+
+        attn_out = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            dropout_rate=self.dropout_rate,
+        )(x_entity, x_entity, deterministic=deterministic)
+
+        x_entity = x_entity + attn_out
+        x = x_entity.reshape((B, T, E, D))
+        x = nn.LayerNorm()(x)
+
+        # =====================================================
+        # 4. MLP
+        # =====================================================
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(self.d_model * 4)(y)
+        y = nn.gelu(y)
+        y = nn.Dense(self.d_model)(y)
+
+        if not deterministic:
+            y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
+
+        return x + y
+
 
 class JaxDynamicsPredictor(nn.Module):
     """
@@ -172,7 +260,7 @@ class JaxDynamicsPredictor(nn.Module):
     객체 생성 시 인자로 직접 전달해야 합니다.
     """
     model_dim: int
-    output_dim: int
+    state_dim: int
     
     # Hyperparameters
     num_heads: int = 4
@@ -180,9 +268,13 @@ class JaxDynamicsPredictor(nn.Module):
     dropout_rate: float = 0.1
 
     @nn.compact
-    def __call__(self, history, static_features, deterministic: bool = True):
-        history_dim = history.shape[2]
-        static_dim = static_features.shape[1]
+    def __call__(self, history, static_features, future_actions, deterministic: bool = True):
+        """
+        history:         (B, T_history, E, X+A)
+        static_features: (B, E, S)
+        """
+        B, H, E, history_dim = history.shape
+        static_dim = static_features.shape[-1]
         
         # Instantiate Encoder
         encoder = JaxAxialTransformerEncoder(
@@ -194,18 +286,28 @@ class JaxDynamicsPredictor(nn.Module):
             dropout_rate=self.dropout_rate
         )
         
-        # Latent: (B, E, D_MODEL)
-        latent = encoder(history, static_features, deterministic=deterministic)
+        # memory: (B, T_history, E, D_MODEL)
+        memory = encoder(history, static_features, deterministic=deterministic)
         
-        # 2. Decoder (Prediction Head)
-        # Sequential: Linear -> GELU -> Linear -> GELU -> Linear
-        x = nn.Dense(self.model_dim * 4)(latent)
-        x = nn.gelu(x)
-        x = nn.Dense(self.model_dim)(x)
-        x = nn.gelu(x)
-        prediction = nn.Dense(self.output_dim)(x)
+        # Action embedding for decoder input
+        # (B, T_pred, E, A) -> (B, T_pred, E, D_MODEL)
+        x = nn.Dense(self.model_dim, name="action_embedding")(future_actions)
+
+        # Decoder Blocks
+        for i in range(self.num_layers):
+            x = JaxAxialDecoderBlock(
+                d_model=self.model_dim,
+                num_heads=self.num_heads,
+                dropout_rate=self.dropout_rate,
+                name=f"decoder_block_{i}",
+            )(x, memory, deterministic=deterministic)
+
+        x = nn.LayerNorm()(x)
+
+        # Prediction Head (B, T_pred, E, X)
+        pred = nn.Dense(self.state_dim, name="pred_head")(x)
         
-        return prediction
+        return pred
 
 
 

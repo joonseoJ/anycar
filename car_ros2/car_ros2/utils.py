@@ -4,6 +4,7 @@ from car_dynamics.models_jax import DynamicParams
 from car_dynamics.controllers_jax import MPPIParams
 from car_dynamics.envs import CarEnvParams
 from typing import Union, List
+import numpy as np
 
 def load_env_params_numeric() -> CarEnvParams:
     return CarEnvParams(
@@ -95,19 +96,19 @@ def load_mppi_params() -> MPPIParams:
         sample_sigma=1.0,
         lam=0.1,
         n_rollouts=100,        
-        a_min=[-1, -1.], # first dim steer, 2nd throttle
-        a_max=[1., 1.],
-        a_mag=[1., 1.],
-        a_shift=[0., 0.],
+        a_min=-np.ones((5, 6)).flatten(),
+        a_max=np.ones((5, 6)).flatten(),
+        a_mag=-np.ones((5, 6)).flatten(),
+        a_shift=-np.zeros((5, 6)).flatten(),
         delay=0,
-        len_history=50,
+        len_history=100,
         debug=False,
         fix_history=False,
         num_obs=13,
         num_actions=6,
         num_entities=5,
         num_intermediate=7,
-        h_knot=5,
+        h_knot=8,
         smooth_alpha=1.0,
         dynamics="transformer-jax",
         dual=True, 

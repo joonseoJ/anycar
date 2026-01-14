@@ -15,17 +15,19 @@ from car_foundation import CAR_FOUNDATION_MODEL_DIR
 from car_ros2.utils import load_mppi_params, load_dynamic_params
 
 
-resume_model_name = "2026-01-08T15:48:33.113-model_checkpoint"
+resume_model_name = "2026-01-14T11:14:00.296-model_checkpoint"
 resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
 dynamics = DynamicsJax({
     'model_path': resume_model_folder_path,
     'model_dim': 128,
     'state_dim': 13,
     'action_dim': 6,
-    'static_dim': 6,
+    'static_dim': 9,
     'history_dim': 19,
     'history_length': 100,
     'num_entities': 5,
+    'num_heads': 4,
+    'num_layers': 2
 })
 mppi_rollout_fn = rollout_fn_jax(dynamics)
 
@@ -41,7 +43,7 @@ class TestMPPIController(unittest.TestCase):
         self.E = 5    # Entities
         self.X = 13    # State Dim
         self.A = 6    # Action Dim
-        self.S = 6 #9    # Static Feature Dim
+        self.S = 9    # Static Feature Dim
         self.H_dim = self.X + self.A # History Feature Dim
         
         # Horizon Length Calculation
@@ -65,7 +67,8 @@ class TestMPPIController(unittest.TestCase):
         self.dummy_history = jnp.zeros((self.T, self.E, self.H_dim))
         self.dummy_static = jnp.zeros((self.E, self.S))
         self.dummy_current_state = jnp.zeros((self.E, self.X))
-        
+        self.dummy_pred_input = jnp.ones((self.Horizon, self.E, self.X))
+
         # Initialize Running Params
         self.running_params = self.controller.get_init_params()
         # Overwrite state_hist with correct shape for multi-entity

@@ -280,12 +280,14 @@ class MPPIController(BaseController):
         diff_vel = state_step[:, 0, 7] - goal[3]
 
         diff_throttle = jnp.linalg.norm(action_step[:, 1:, 4] - prev_action[:, 1:, 4], axis=1)
+        diff_steering = jnp.linalg.norm(action_step[:, 1:, 5] - prev_action[:, 1:, 5], axis=1)
         
         reward_pos_err = -dist_pos ** 2
         reward_psi = -diff_psi ** 2
         reward_vel = -diff_vel ** 2
         reward_throttle = - diff_throttle ** 2
-        reward = reward_pos_err * 5.0 + reward_psi * 5.0 + reward_vel * 1. + reward_throttle * 0.0
+        reward_steering = - diff_steering ** 2
+        reward = reward_pos_err*5.0 + reward_psi*5.0 + reward_vel*1. + reward_throttle*1.0 + reward_steering*1.0
         reward *= (self.params.discount ** step)
         return (step + 1, action_step), reward
     
