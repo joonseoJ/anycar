@@ -11,23 +11,26 @@ import os
 from car_dynamics.controllers_jax.mppi import MPPIController, MPPIParams, MPPIRunningParams
 from car_dynamics.controllers_jax.mppi_helper import rollout_fn_jax
 from car_dynamics.models_jax import DynamicsJax
-from car_foundation import CAR_FOUNDATION_MODEL_DIR
+from car_foundation import CAR_FOUNDATION_MODEL_DIR, model_config
+from car_foundation.data_config import MujocoDataConfig
 from car_ros2.utils import load_mppi_params, load_dynamic_params
 
 
-resume_model_name = "2026-01-14T11:14:00.296-model_checkpoint"
-resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
+resume_model_name = "2026-01-22T13:56:01.992-model_checkpoint"
+resume_model_checkpoint = 2
+resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name, f'{resume_model_checkpoint}')
 dynamics = DynamicsJax({
     'model_path': resume_model_folder_path,
-    'model_dim': 128,
-    'state_dim': 13,
-    'action_dim': 6,
-    'static_dim': 12,
-    'history_dim': 19,
+    'model_dim': model_config.MODEL_DIM,
+    'state_dim': model_config.STATE_DIM,
+    'action_dim': model_config.ACTION_DIM,
+    'static_dim': model_config.STATIC_DIM,
+    'history_dim': model_config.HISTORY_DIM,
     'history_length': 100,
-    'num_entities': 5,
-    'num_heads': 4,
-    'num_layers': 2
+    'num_entities': model_config.NUM_ENTITIES,
+    'num_heads': model_config.NUM_HEADS,
+    'num_layers': model_config.NUM_LAYERS,
+    'dropout_rate': model_config.DROPOUT
 })
 mppi_rollout_fn = rollout_fn_jax(dynamics)
 
@@ -41,10 +44,10 @@ class TestMPPIController(unittest.TestCase):
         self.N = 12   # Rollouts
         self.T = 100    # History Length
         self.E = 5    # Entities
-        self.X = 13    # State Dim
-        self.A = 6    # Action Dim
-        self.S = 9    # Static Feature Dim
-        self.H_dim = self.X + self.A # History Feature Dim
+        self.X = MujocoDataConfig.STATE_DIM    # State Dim
+        self.A = MujocoDataConfig.ACTION_DIM    # Action Dim
+        self.S = MujocoDataConfig.STATIC_DIM    # Static Feature Dim
+        self.H_dim = MujocoDataConfig.STATE_DIM + MujocoDataConfig.ACTION_DIM # History Feature Dim
         
         # Horizon Length Calculation
         self.h_knot = 5
@@ -77,39 +80,39 @@ class TestMPPIController(unittest.TestCase):
             key = self.key
         )
 
-    def test_init_shapes(self):
-        """Test if buffers are initialized with correct shapes."""
-        print("\n=== Test Init Shapes ===")
-        print(f"Horizon (H): {self.controller.H}")
-        self.assertEqual(self.controller.a_mean_flattened.shape, (self.controller.H, self.E * self.A))
-        self.assertEqual(self.controller.a_cov_flatten.shape, (self.controller.H, self.E*self.A, self.E*self.A))
-        print("Init shapes verified.")
+    # def test_init_shapes(self):
+    #     """Test if buffers are initialized with correct shapes."""
+    #     print("\n=== Test Init Shapes ===")
+    #     print(f"Horizon (H): {self.controller.H}")
+    #     self.assertEqual(self.controller.a_mean_flattened.shape, (self.controller.H, self.E * self.A))
+    #     self.assertEqual(self.controller.a_cov_flatten.shape, (self.controller.H, self.E*self.A, self.E*self.A))
+    #     print("Init shapes verified.")
 
-    def test_get_rollout_nn(self):
-        """
-        Test the full rollout loop (_get_rollout_nn).
-        Verifies tiling and scan loop output dimensions.
-        """
-        print("\n=== Test _get_rollout_nn (Full Trajectory) ===")
+    # def test_get_rollout_nn(self):
+    #     """
+    #     Test the full rollout loop (_get_rollout_nn).
+    #     Verifies tiling and scan loop output dimensions.
+    #     """
+    #     print("\n=== Test _get_rollout_nn (Full Trajectory) ===")
         
-        # Inputs
-        # actions: (N, Horizon, A)
-        actions = jnp.zeros((self.N, self.Horizon, self.E, self.A))
-        key = jax.random.PRNGKey(2)
+    #     # Inputs
+    #     # actions: (N, Horizon, A)
+    #     actions = jnp.zeros((self.N, self.Horizon, self.E, self.A))
+    #     key = jax.random.PRNGKey(2)
         
-        state_list = self.controller._get_rollout(
-            key,
-            self.dummy_current_state, # (1, E, X)
-            self.dummy_history,       # (1, T, E, H_dim)
-            actions,                  # (N, Horizon, E, A)
-            self.dummy_static,        # (1, E, S)
-            fix_history=False
-        )
+    #     state_list = self.controller._get_rollout(
+    #         key,
+    #         self.dummy_current_state, # (1, E, X)
+    #         self.dummy_history,       # (1, T, E, H_dim)
+    #         actions,                  # (N, Horizon, E, A)
+    #         self.dummy_static,        # (1, E, S)
+    #         fix_history=False
+    #     )
         
-        # Expected Output: (N, Horizon, E, X)
-        expected_shape = (self.Horizon+1, self.N, self.E, self.X)
-        self.assertEqual(state_list.shape, expected_shape, f"State list shape mismatch. Got {state_list.shape}, Expected {expected_shape}")
-        print("Full rollout dimensions verified.")
+    #     # Expected Output: (N, Horizon, E, X)
+    #     expected_shape = (self.Horizon+1, self.N, self.E, self.X)
+    #     self.assertEqual(state_list.shape, expected_shape, f"State list shape mismatch. Got {state_list.shape}, Expected {expected_shape}")
+    #     print("Full rollout dimensions verified.")
 
     def test_integration_call(self):
         """

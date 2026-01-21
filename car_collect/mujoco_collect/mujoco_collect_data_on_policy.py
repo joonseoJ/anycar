@@ -30,6 +30,8 @@ from car_ros2.utils import load_mppi_params, load_dynamic_params
 import jax
 import jax.numpy as jnp
 
+import glob
+
 import faulthandler
 faulthandler.enable()
 
@@ -60,26 +62,12 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
             {"pos":[-0.158, -0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
         ]
     })
+    # dataset.car_params = env.change_parameters()
     env.reset()
 
     # set the simulator
     dataset.car_params["sim"] = env.name
-    # set the wheelbase
-    dataset.car_params["wheelbase"] = env.wheelbase
-    # generate a new mass
-    dataset.car_params["mass"] = env.generate_new_mass()
-    # generate a new com
-    dataset.car_params["com"] = env.generate_new_com()
-    # generate a new friction
-    dataset.car_params["friction"] = env.generate_new_friction()
-    # generate new max throttle
-    dataset.car_params["max_throttle"] = env.generate_new_max_throttle()
-    # generate new delay
-    dataset.car_params["delay"] = env.generate_new_delay()
-    # generate new max steering
-    dataset.car_params["max_steer"] = env.generate_new_max_steering()
-    # generate new steering bias
-    dataset.car_params["steer_bias"] = env.generate_new_steering_bias()
+   
     print("Car Params", dataset.car_params)
 
     #choose to change parameters or not
@@ -106,24 +94,26 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
         key = key2,
     )
     
-    
-    # tuned kp and kd
-    kp = np.random.uniform(6, 10)
-    kd = np.random.uniform(0.5, 1.5)
-    
     is_terminate = False 
     history_length = mppi.params.len_history
+
+    dataset_path = os.path.join(CAR_FOUNDATION_DATA_DIR, 'mujoco_sim_debugging')
+    dataset_files = glob.glob(os.path.join(dataset_path, '*.pkl'))
+    dataset_file = random.choice(dataset_files)
+    with open(dataset_file, "rb") as f:
+        raw_data = pickle.load(f)
+        actions = np.array(raw_data.data_logs['action'], dtype=np.float32)
     for t in tqdm(range(simend)):
         obs = env.obs_state()
-        state = obs['current_state']
+        state_before_step = obs['current_state'].copy()
         static_features = obs['static_features']
         
         if t == 0:
             for _ in range(history_length):
-                mppi_running_params = mppi.feed_hist(mppi_running_params, state, np.zeros((mppi.params.num_entities, mppi.params.num_actions)))
+                mppi_running_params = mppi.feed_hist(mppi_running_params, state_before_step, np.zeros((mppi.params.num_entities, mppi.params.num_actions)))
 
         target_pos_arr, frenet_pose = global_planner.generate(
-            state[0, :], 
+            state_before_step[0, :], 
             env.dt, 
             (mppi_params.h_knot - 1) * mppi_params.num_intermediate + 2 + mppi_params.delay, 
             True
@@ -131,20 +121,27 @@ def rollout(id, simend, render, debug_plots, datadir, mppi: MPPIController, key_
         target_pos_tensor = jnp.array(target_pos_arr)
         
         # Get MPPI Action
-        action, mppi_running_params, mppi_info = mppi(
-            state, 
-            target_pos_tensor, 
-            mppi_running_params, 
-            static_features, 
-        )
+        # action, mppi_running_params, mppi_info = mppi(
+        #     state_before_step, 
+        #     target_pos_tensor[1:], 
+        #     mppi_running_params, 
+        #     static_features, 
+        # )
+        # env.world.trajectory[1] = {
+        #     "traj": mppi_info['trajectory'][::5, 0, :2],
+        #     "rgba": np.array([0.0, 0.0, 1.0, 1.0])
+        # }
+
+        action = actions[t]
+        optim_traj = jnp.stack(mppi._get_rollout_nn(key2, state_before_step, mppi_running_params.state_hist, actions[t:t+50][None], static_features))[0]
         env.world.trajectory[1] = {
-            "traj": mppi_info['trajectory'][::5, 0, :2],
+            "traj": optim_traj[::5, 0, :2],
             "rgba": np.array([0.0, 0.0, 1.0, 1.0])
         }
-        mppi_running_params = mppi.feed_hist(mppi_running_params, state, action)
-        # action = action.at[:,4].set(action[:,4]*-1)
         
         obs, reward, done, info = env.step(np.array(action))
+        state_after_step = obs['current_state'].copy()
+        mppi_running_params = mppi.feed_hist(mppi_running_params, state_after_step, action)
 
         # log_data(dataset, obs)
 
@@ -194,9 +191,9 @@ if __name__ == "__main__":
     simend = 20000
     episodes = 100
     data_dir = os.path.join(CAR_FOUNDATION_DATA_DIR, "mujoco_on_policy")
-    # resume_model_name = "2026-01-16T20:44:37.066-model_checkpoint"
-    resume_model_name = "2026-01-19T10:58:54.293-model_checkpoint"
-    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name)
+    resume_model_name = "2026-01-22T13:56:01.992-model_checkpoint"
+    resume_model_checkpoint = 2
+    resume_model_folder_path = os.path.join(CAR_FOUNDATION_MODEL_DIR, resume_model_name, f'{resume_model_checkpoint}')
     os.makedirs(data_dir, exist_ok=True)
 
     mppi_params = load_mppi_params()
@@ -212,7 +209,8 @@ if __name__ == "__main__":
         'history_length': 100,
         'num_entities': model_config.NUM_ENTITIES,
         'num_heads': model_config.NUM_HEADS,
-        'num_layers': model_config.NUM_LAYERS
+        'num_layers': model_config.NUM_LAYERS,
+        'dropout_rate': model_config.DROPOUT
     })
     mppi_rollout_fn = rollout_fn_jax(dynamics)
     mppi = MPPIController(

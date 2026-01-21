@@ -44,6 +44,11 @@ class MuJoCoCar(gym.Env):
                 {"pos":[-0.158,  0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
                 {"pos":[-0.158, -0.115, 0.0488],  "mask":[False, False, False, False, True, True ], "radius": 0.04, "width": 0.02, "mass": 0.498952},
             ]
+            new_wheel_configs = self.generate_new_actuation_config()
+            for i in range(len(self.wheel_configs)):
+                wheel_key = ["FL", "FR", "RL", "RR"][i]
+                self.wheel_configs[i]["mask"] = new_wheel_configs[wheel_key]
+        
         self.num_wheels = len(self.wheel_configs)
         
         self.world = World({'is_render': self.is_render, 'wheel_configs': self.wheel_configs})
@@ -243,7 +248,7 @@ class MuJoCoCar(gym.Env):
         return new_friction
     
     def generate_new_wheel_parameters(self):
-        default_radius, default_width = self.world.model.geom_size[self.world.rim_geom_ids[0]]
+        default_radius, default_width, _ = self.world.model.geom_size[self.world.rim_geom_ids[0]]
         default_mass = self.world.model.body_mass[self.world.rim_body_ids[0]]
 
         radius = np.random.normal(default_radius, default_radius/4, 1)
@@ -257,7 +262,7 @@ class MuJoCoCar(gym.Env):
         default_rear = self.world.model.body_pos[self.world.knuckle_body_ids[2]][0]
 
         front = np.random.normal(default_front, default_front/4, 1)
-        rear = np.random.normal(default_rear, default_rear/4, 1)
+        rear = np.random.normal(default_rear, abs(default_rear)/4, 1)
         return [front, rear]
     
     def generate_new_wheel_track(self):

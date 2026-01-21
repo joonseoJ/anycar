@@ -469,7 +469,7 @@ class World:
                 elif key == "wheel_parameters":
                     radius, width, mass = item
                     for geom_id in self.rim_geom_ids:
-                        self.model.geom_size[geom_id][:2] = [radius, width]
+                        self.model.geom_size[geom_id][:2] = np.concatenate([radius, width])
                     for body_id in self.rim_body_ids:
                         self.model.body_mass[body_id] = mass
                 elif key == "wheel_base":

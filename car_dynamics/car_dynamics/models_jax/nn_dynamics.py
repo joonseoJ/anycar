@@ -7,7 +7,7 @@ import orbax
 import optax
 import numpy as np
 from car_foundation import CAR_FOUNDATION_MODEL_DIR
-from car_foundation.jax_models import JaxDynamicsPredictor, TmpMLP
+from car_foundation.jax_models import JaxDynamicsPredictor, JaxHOTDynamicsPredictor
 from termcolor import colored
 from flax.training import orbax_utils, train_state
 from functools import partial
@@ -44,49 +44,61 @@ class DynamicsJax:
         # print("input_std", self.input_std)
 
     def load_jax_model(self):
-        self.model = model = TmpMLP(
-            model_dim=self.params['model_dim'],
+        self.model = JaxHOTDynamicsPredictor(
+            d_model=self.params['model_dim'],
+            mlp_dim=self.params['model_dim']*4,
             state_dim=self.params['state_dim'],
             num_heads=self.params['num_heads'],
-            num_layers=self.params['num_layers']
+            num_layers=self.params['num_layers'],
+            dropout_rate=self.params['dropout_rate'],
         )
         dummy_hist = jnp.ones((1, self.params['history_length'], self.params['num_entities'], self.params['history_dim']))
         dummy_static = jnp.ones((1, self.params['num_entities'], self.params['static_dim']))
-        dummy_pred_input = jnp.ones((1, 1, self.params['num_entities'], self.params['action_dim']))
+        dummy_pred_input = jnp.ones((1, 50, self.params['num_entities'], self.params['action_dim']))
 
 
         self.key, key2 = jax.random.split(self.key, 2)
         self.var = self.model.init(key2, dummy_hist, dummy_static, dummy_pred_input)
-        params = self.var['params']
-
-        self.model_state = train_state.TrainState.create(
-            apply_fn=model.apply,
-            params=params,
-            tx=optax.adamw(1e-4)
-        )
-
+        
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         manager = orbax.checkpoint.CheckpointManager(
             self.params['model_path'],
             checkpointer,
-            orbax.checkpoint.CheckpointManagerOptions()
         )
+        restored = manager.restore(self.params['model_path'])
 
-        step = manager.latest_step()
-        print("Restoring checkpoint at step:", step)
+        self.var['params'] = restored["model"]["params"]
+        
+        # params = self.var['params']
 
-        restore_target = {
-            'model': self.model_state,
-            'description': 'Inference future states (B,T,E,X) without normalizing'
-        }
+        # self.model_state = train_state.TrainState.create(
+        #     apply_fn=model.apply,
+        #     params=params,
+        #     tx=optax.adamw(1e-4)
+        # )
 
-        self.ckpt = manager.restore(
-            step,
-            restore_target
-        )    
+        # checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        # manager = orbax.checkpoint.CheckpointManager(
+        #     self.params['model_path'],
+        #     checkpointer,
+        #     orbax.checkpoint.CheckpointManagerOptions()
+        # )
+
+        # step = manager.latest_step()
+        # print("Restoring checkpoint at step:", step)
+
+        # restore_target = {
+        #     'model': self.model_state,
+        #     'description': 'Inference future states (B,T,E,X) without normalizing'
+        # }
+
+        # self.ckpt = manager.restore(
+        #     step,
+        #     restore_target
+        # )    
         
     @partial(jax.jit, static_argnums=(0,))
-    def step(self, key, history: jax.Array, state: jax.Array, action: jax.Array, static_features: jax.Array):
+    def step(self, key, history: jax.Array, current_state: jax.Array, action: jax.Array, static_features: jax.Array):
         """
         History: (Batch, T_history, E, H)
         State: (Batch, E, X)
@@ -97,16 +109,14 @@ class DynamicsJax:
 
         _, deltas = differentiate_state(history)
 
-        y_pred_delta = self.model_state.apply_fn(
-            {'params': self.model_state.params},
+        y_pred_delta = self.model.apply(
+            self.var,
             deltas,
             static_features,
             action,
             rngs=key2,
             deterministic=True
         )
-
-        current_state = history[:, -1, :, :MujocoDataConfig.HISTORY_STATE_END]
 
         y_pred = integrate_state(current_state, y_pred_delta)
             

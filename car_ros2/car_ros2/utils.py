@@ -5,6 +5,7 @@ from car_dynamics.controllers_jax import MPPIParams
 from car_dynamics.envs import CarEnvParams
 from typing import Union, List
 import numpy as np
+from car_foundation.data_config import MujocoDataConfig
 from car_foundation import model_config
 
 def load_env_params_numeric() -> CarEnvParams:
@@ -96,20 +97,20 @@ def load_mppi_params() -> MPPIParams:
         discount=1.0,
         sample_sigma=1.0,
         lam=0.1,
-        n_rollouts=100,        
+        n_rollouts=300,        
         a_min = np.array([
             [0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, -1, -1],
+            [0, 0, 0, 0, -1, -1],
+            [0, 0, 0, 0, -1, -1],
+            [0, 0, 0, 0, -1, -1],
         ]).flatten(),
         a_max = np.array([
             [0 , 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 1, 1],
         ]).flatten(),
         a_mag = np.ones((5, 6)).flatten(),
         a_shift = np.zeros((5, 6)).flatten(),
@@ -117,11 +118,11 @@ def load_mppi_params() -> MPPIParams:
         len_history=100,
         debug=False,
         fix_history=False,
-        num_obs=model_config.STATE_DIM,
-        num_actions=model_config.ACTION_DIM,
+        num_obs=MujocoDataConfig.STATE_DIM,
+        num_actions=MujocoDataConfig.ACTION_DIM,
         num_entities=model_config.NUM_ENTITIES,
-        num_intermediate=5,
-        h_knot=6,
+        num_intermediate=7,
+        h_knot=8,
         smooth_alpha=1.0,
         dynamics="transformer-jax",
         dual=True, 

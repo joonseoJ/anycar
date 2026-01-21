@@ -24,7 +24,7 @@ from car_foundation import CAR_FOUNDATION_DATA_DIR, CAR_FOUNDATION_MODEL_DIR
 from car_foundation.dataset import DynamicsDataset, IssacSimDataset, MujocoDataset
 from car_foundation.models import TorchMLP, TorchTransformer, TorchTransformerDecoder, TorchGPT2
 from car_foundation.jax_models import JaxDynamicsPredictor, JaxMLP, JaxCNN, TmpMLP, JaxHOTDynamicsPredictor
-from car_foundation.utils import integrate_state, q_inverse_jax, q_multiply_jax, q_to_so3_jax
+from car_foundation.utils import integrate_state, q_inverse_jax, q_multiply_jax, q_to_so3_jax, quat_to_yaw_jax
 from car_foundation.data_config import MujocoDataConfig
 from car_foundation import model_config
 import datetime
@@ -47,9 +47,9 @@ DROPOUT_KEY = "dropout"
 INPUT_KEY = "input_rng"
 
 # Set random seeds for reproducibility across PyTorch, NumPy, and Python
-torch.manual_seed(3407)
-np.random.seed(3407)
-random.seed(3407)
+# torch.manual_seed(3407)
+# np.random.seed(3407)
+# random.seed(3407)
 
 
 ################################################################################
@@ -85,17 +85,17 @@ elif RESUME:
     warmup_period = 5
     num_epochs = 40
     load_checkpoint = True
-    resume_model_checkpint = 10
-    resume_model_name = "2026-01-20T13:29:05.929-model_checkpoint"
+    resume_model_checkpint = 2
+    resume_model_name = "2026-01-22T13:56:01.992-model_checkpoint"
 else:
     lr_begin = 5e-4
     warmup_period = 500
-    num_epochs = 50
+    num_epochs = 10
     load_checkpoint = False
     resume_model_checkpint = 0
     resume_model_name = ""
 
-val_every = 10          # Validation interval (epochs)
+val_every = 1          # Validation interval (epochs)
 batch_size = 128
 lambda_l2 = 1e-4        # Weight decay
 dataset_path = os.path.join(CAR_FOUNDATION_DATA_DIR, 'mujoco_sim_debugging')
@@ -180,7 +180,7 @@ num_steps_per_epoch = len(train_loader)
 wandb.init(
     # set the wandb project where this run will be logged
     project="transformer-sequence-prediction",
-    name=architecture,
+    name=f'{architecture}_{save_model_folder_prefix}',
 
     # track hyperparameters and run metadata
     config={
@@ -290,13 +290,8 @@ def apply_batch(var_collect, history, static_features, action, y, rngs):
     """
     Run inference (prediction) on a batch.
     Normalizes input, predicts relative changes, and transforms back to world coordinates.
-    """
-    # x = history[:, 1:, :, :]
-    x = history
-    
-    # Forward pass
-    y_pred = model.apply(var_collect, x, static_features, action, rngs=rngs, deterministic=True)
-    # print(attn_mask.shape)
+    """    
+    y_pred = model.apply(var_collect, history, static_features, action, rngs=rngs, deterministic=True)
     
     return y_pred
 
@@ -383,8 +378,29 @@ def loss_fn(
     # 3. Total Loss Combination
     # -----------------------------------------------------------
     total_loss = (w_step * loss_step) + (w_accum * loss_accum)
+
+    # -----------------------------------------------------------
+    # Aux for debugging / logging
+    # -----------------------------------------------------------
+    aux = {
+        "loss_step": loss_step,
+        "loss_accum": loss_accum,
+        "loss_total": total_loss,
+        "step_pos_x": jnp.mean(weighted_step_loss[..., 0]),
+        "step_pos_y": jnp.mean(weighted_step_loss[..., 1]),
+        "step_pos_z": jnp.mean(weighted_step_loss[..., 2]),
+        "step_roll": jnp.mean(weighted_step_loss[..., 3]),
+        "step_pitch": jnp.mean(weighted_step_loss[..., 4]),
+        "step_yaw": jnp.mean(weighted_step_loss[..., 5]),
+        "step_v_x": jnp.mean(weighted_step_loss[..., 6]),
+        "step_v_y": jnp.mean(weighted_step_loss[..., 7]),
+        "step_v_z": jnp.mean(weighted_step_loss[..., 8]),
+        "step_w_x": jnp.mean(weighted_step_loss[..., 9]),
+        "step_w_y": jnp.mean(weighted_step_loss[..., 10]),
+        "step_w_z": jnp.mean(weighted_step_loss[..., 11]),
+    }
     
-    return total_loss
+    return total_loss, aux
 
 
 ################################################################################
@@ -392,10 +408,10 @@ def loss_fn(
 # Functions to evaluate model performance and plot trajectories.
 ################################################################################
 
-def val_episode(var_collect, episode_num, rngs):
+def val_episode(var_collect, dataset, episode_num, rngs):
     """Run inference on a single validation episode."""    
     # Fetch data from dataset
-    file_info = val_dataset.file_indices[episode_num]
+    file_info = dataset.file_indices[episode_num]
     file_path = file_info['file_path']
     start_win_idx = file_info['start_idx']
     end_win_idx = file_info['end_idx']
@@ -403,12 +419,11 @@ def val_episode(var_collect, episode_num, rngs):
     print(f"Validating File: {file_path}")
     print(f"Window Indices: {start_win_idx} ~ {end_win_idx} (Total {file_info['num_windows']})")
 
-    episode_subset = Subset(val_dataset, range(start_win_idx, end_win_idx))
-    dataloader = DataLoader(episode_subset, batch_size=batch_size, shuffle=False) # 순서대로 예측해야 함!
+    episode_subset = Subset(dataset, range(start_win_idx, end_win_idx))
+    dataloader = DataLoader(episode_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers) # 순서대로 예측해야 함!
     
-    episode = val_dataset.get_episode(episode_num) # (T, E, X+A)
-    predictions_list = [episode[:val_dataset.history_length+1, :, :MujocoDataConfig.HISTORY_STATE_END].numpy()]  # 초기 상태 포함 (T_history+1, E, X)
-
+    episode = dataset.episodes[episode_num].numpy() # (T, E, X+A)
+    predictions_list = [episode[:dataset.history_length+1, :, :MujocoDataConfig.HISTORY_STATE_END]]  # 초기 상태 포함 (T_history+1, E, X)
     for history, static_features, action, y, current_state in dataloader:
         # Convert to JAX arrays
         history = jnp.array(history.numpy()) #(B, T_history, E, X+A)
@@ -431,6 +446,22 @@ def val_episode(var_collect, episode_num, rngs):
 def val_loop(state, var_collect, val_loader, rngs):
     """Compute average loss over the entire validation dataset."""
     val_loss = 0.0
+    val_loss_total = 0.0
+    val_loss_step = 0.0
+    val_loss_accum = 0.0
+    val_loss_step_pos_x = 0.0
+    val_loss_step_pos_y = 0.0
+    val_loss_step_pos_z = 0.0
+    val_loss_step_roll = 0.0
+    val_loss_step_pitch = 0.0
+    val_loss_step_yaw = 0.0
+    val_loss_step_v_x = 0.0
+    val_loss_step_v_y = 0.0
+    val_loss_step_v_z = 0.0
+    val_loss_step_w_x = 0.0
+    val_loss_step_w_y = 0.0
+    val_loss_step_w_z = 0.0
+
     t_val = tqdm.tqdm(val_loader)
     for i, (history, static_features, action, y, current_state) in enumerate(t_val):
         # Convert PyTorch tensors to JAX arrays
@@ -441,35 +472,111 @@ def val_loop(state, var_collect, val_loader, rngs):
         current_state = jnp.array(current_state.numpy())
         
         # Accumulate loss
-        val_loss += loss_fn(state, var_collect, history, static_features, action, y, current_state, rngs=global_rngs, deterministic=True).item()
+        loss, aux = loss_fn(state, var_collect, history, static_features, action, y, current_state, rngs=global_rngs, deterministic=True)
+        val_loss += loss.item()
+
+        val_loss_total += aux["loss_total"].item()
+        val_loss_step += aux["loss_step"].item()
+        val_loss_accum += aux["loss_accum"].item()
+        val_loss_step_pos_x += aux["step_pos_x"].item()
+        val_loss_step_pos_y += aux["step_pos_y"].item()
+        val_loss_step_pos_z += aux["step_pos_z"].item()
+        val_loss_step_roll += aux["step_roll"].item()
+        val_loss_step_pitch += aux["step_pitch"].item()
+        val_loss_step_yaw += aux["step_yaw"].item()
+        val_loss_step_v_x += aux["step_v_x"].item()
+        val_loss_step_v_y += aux["step_v_y"].item()
+        val_loss_step_v_z += aux["step_v_z"].item()
+        val_loss_step_w_x += aux["step_w_x"].item()
+        val_loss_step_w_y += aux["step_w_y"].item()
+        val_loss_step_w_z += aux["step_w_z"].item()
+
         t_val.set_description(f'Validation Loss: {(val_loss / (i + 1)):.4f}')
         t_val.refresh()
-        
-    val_loss /= len(val_loader)
+    
+    val_loader_len = len(val_loader)
+    val_loss /= val_loader_len
+    val_loss_total /= val_loader_len
+    val_loss_step /= val_loader_len
+    val_loss_accum /= val_loader_len
+    val_loss_step_pos_x /= val_loader_len
+    val_loss_step_pos_y /= val_loader_len
+    val_loss_step_pos_z /= val_loader_len
+    val_loss_step_roll /= val_loader_len
+    val_loss_step_pitch /= val_loader_len
+    val_loss_step_yaw /= val_loader_len
+    val_loss_step_v_x /= val_loader_len
+    val_loss_step_v_y /= val_loader_len
+    val_loss_step_v_z /= val_loader_len
+    val_loss_step_w_x /= val_loader_len
+    val_loss_step_w_y /= val_loader_len
+    val_loss_step_w_z /= val_loader_len
+
+    tqdm.tqdm.write(f"=====> Validation Loss: {val_loss:.4f}")
+    tqdm.tqdm.write(f"          Validation Loss Total: {val_loss_total/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Loss Step: {val_loss_step/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Loss Accum: {val_loss_accum/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Pos X: {val_loss_step_pos_x/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Pos Y: {val_loss_step_pos_y/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Pos Z: {val_loss_step_pos_z/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Roll: {val_loss_step_roll/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Pitch: {val_loss_step_pitch/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Yaw: {val_loss_step_yaw/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Vx: {val_loss_step_v_x/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Vy: {val_loss_step_v_y/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Vz: {val_loss_step_v_z/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Wx: {val_loss_step_w_x/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Wy: {val_loss_step_w_y/1e-6:.4f} x 1e-6")
+    tqdm.tqdm.write(f"          Validation Step Wz: {val_loss_step_w_z/1e-6:.4f} x 1e-6")
     return val_loss
 
-def visualize_episode(epoch_num: int, episode_num, val_dataset, rngs):
+
+def visualize_episode(val_collect, epoch_num: int, episode_num, dataset, rngs):
     """
     Visualize ground truth vs predicted trajectory and log to WandB.
     This temporarily restores the specific checkpoint to visualize.
     """
-    # Re-initialize collection
-    val_collect = model.init(init_rngs, jax_history_input, jax_static_features_input, jax_prediction_input)
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    # # Re-initialize collection
+    # val_collect = model.init(init_rngs, jax_history_input, jax_static_features_input, jax_prediction_input)
+    # orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     
-    # Load specific checkpoint for visualization
-    raw_restored = orbax_checkpointer.restore(os.path.join(save_model_folder_path, f"{epoch_num}", "default"))
-    val_collect['params'] = raw_restored['model']['params']
+    # # Load specific checkpoint for visualization
+    # raw_restored = orbax_checkpointer.restore(os.path.join(save_model_folder_path, f"{epoch_num}", "default"))
+    # val_collect['params'] = raw_restored['model']['params']
     
     # Predict
-    predicted_states = val_episode(val_collect, episode_num, rngs) # (T, E, X)
-    episode = val_dataset.get_episode(episode_num) # (T, E, X+A)
+    predicted_states = val_episode(val_collect, dataset, episode_num, rngs) # (T, E, X)
+    episode = dataset.episodes[episode_num] # (T, E, X+A)
 
     # Plotting
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
     # 1. Trajectory (X-Y)
-    axs[0, 0].plot(episode[:, 0, 0], episode[:, 0, 1], label='Ground Truth', marker='o', markersize=5)
-    axs[0, 0].plot(predicted_states[:, 0, 0], predicted_states[:, 0, 1], label='Predicted', marker='x', markersize=5)
+    x_gt = episode[:, 0, 0]
+    y_gt = episode[:, 0, 1]
+    yaw_gt = quat_to_yaw_jax(episode[:, 0, 3:7].numpy())
+
+    x_pred = predicted_states[:, 0, 0]
+    y_pred = predicted_states[:, 0, 1]
+    yaw_pred = quat_to_yaw_jax(predicted_states[:, 0, 3:7])
+    u_gt = np.cos(yaw_gt)
+    v_gt = np.sin(yaw_gt)
+
+    u_pred = np.cos(yaw_pred)
+    v_pred = np.sin(yaw_pred)
+    axs[0, 0].plot(episode[:, 0, 0], episode[:, 0, 1], label='Ground Truth', marker='o', markersize=2, alpha=0.5)
+    axs[0, 0].plot(predicted_states[:, 0, 0], predicted_states[:, 0, 1], label='Predicted', marker='x', markersize=2)
+    
+    yaw_step = 50
+    axs[0, 0].quiver(
+        x_gt[::yaw_step], y_gt[::yaw_step],
+        u_gt[::yaw_step], v_gt[::yaw_step],
+        color='blue', scale=20, width=0.03, alpha=0.5
+    )
+    axs[0, 0].quiver(
+        x_pred[::yaw_step], y_pred[::yaw_step], 
+        u_pred[::yaw_step], v_pred[::yaw_step],
+        color='orange', scale=20, width=0.03
+    )
     axs[0, 0].legend()
     axs[0, 0].axis('equal')
 
@@ -500,12 +607,24 @@ def visualize_episode(epoch_num: int, episode_num, val_dataset, rngs):
 # Iterate through epochs, calculate gradients, update weights, and save checkpoints.
 ################################################################################
 
+#THIS ONE AND ONLY THIS ONE WORKS FUCKING GREAT
+# visualize_episode(global_var, 10, 0, val_dataset, global_rngs)
+
 train_losses = []
 val_losses = []
 val_epoch_nums = []
 
-for epoch in tqdm.tqdm(range(num_epochs), desc="Epoch"):
+if RESUME:
+    for episode in range(len(test_dataset.episodes)):
+        visualize_episode(global_var, 0, episode, test_dataset, global_rngs) # Visualize specific episode
+        
+
+epoch_bar = tqdm.tqdm(range(num_epochs), desc="Epoch")
+for epoch in epoch_bar:
     running_loss = 0.0
+    epoch_loss_total = 0.0
+    epoch_loss_step = 0.0
+    epoch_loss_accum = 0.0
     t = tqdm.tqdm(train_loader)
     
     # --- Batch Loop ---
@@ -535,11 +654,34 @@ for epoch in tqdm.tqdm(range(num_epochs), desc="Epoch"):
             return loss_fn(global_state, var_collect, history, static_features, action, y, current_state, global_rngs)
         
         # Compute Gradients using value_and_grad
-        grad_fn = jax.value_and_grad(this_loss_fn, has_aux=False)
-        loss, grads = grad_fn(global_var, history, static_features, action, y, current_state)
+        grad_fn = jax.value_and_grad(this_loss_fn, has_aux=True)
+        (loss, aux), grads = grad_fn(global_var, history, static_features, action, y, current_state)
         
         loss_item = loss.item()
         running_loss += loss_item
+
+        epoch_loss_total += aux["loss_total"].item()
+        epoch_loss_step += aux["loss_step"].item()
+        epoch_loss_accum += aux["loss_accum"].item()
+
+        wandb.log({
+            "train/loss_total": aux["loss_total"].item(),
+            "train/loss_step": aux["loss_step"].item(),
+            "train/loss_accum": aux["loss_accum"].item(),
+            "train/step_pos_x": aux["step_pos_x"].item(),
+            "train/step_pos_y": aux["step_pos_y"].item(),
+            "train/step_pos_z": aux["step_pos_z"].item(),
+            "train/step_roll": aux["step_roll"].item(),
+            "train/step_pitch": aux["step_pitch"].item(),
+            "train/step_yaw": aux["step_yaw"].item(),
+            "train/step_v_x": aux["step_v_x"].item(),
+            "train/step_v_y": aux["step_v_y"].item(),
+            "train/step_v_z": aux["step_v_z"].item(),
+            "train/step_w_x": aux["step_w_x"].item(),
+            "train/step_w_y": aux["step_w_y"].item(),
+            "train/step_w_z": aux["step_w_z"].item(),
+            "learning_rate": learning_rate_fn(global_state.step),
+        }, step=global_state.step)
 
         # Update Progress Bar
         t.set_description(f'Epoch {epoch + 1}, Loss: {(running_loss / (i + 1)):.4f}, LR: {learning_rate_fn(global_state.step):.6f}')
@@ -552,7 +694,16 @@ for epoch in tqdm.tqdm(range(num_epochs), desc="Epoch"):
     # --- End of Epoch Logging ---
     running_loss /= len(train_loader)
     train_losses.append(running_loss)
-    wandb.log({"train_loss": running_loss, "learning_rate": learning_rate_fn(global_state.step)})
+    epoch_bar.set_postfix({
+        "Loss": f"{epoch_loss_total / len(train_loader):.4f}",
+        "Step loss": f"{epoch_loss_step / len(train_loader):.4f}",
+        "Accum loss": f"{epoch_loss_accum / len(train_loader):.4f}",
+    })
+    wandb.log({
+        "train/epoch_loss": epoch_loss_total / len(train_loader),
+        "train/epoch_step_loss": epoch_loss_step / len(train_loader),
+        "train/epoch_accum_loss": epoch_loss_accum / len(train_loader),
+    }, step=epoch)
     print(save_model_folder_path)
     
     # --- Save Checkpoint ---
@@ -565,7 +716,7 @@ for epoch in tqdm.tqdm(range(num_epochs), desc="Epoch"):
 
     # --- Validation Interval ---
     if (epoch + 1) % val_every == 0:
-        visualize_episode(epoch + 1, 1, val_dataset, global_rngs) # Visualize specific episode
+        visualize_episode(global_var, epoch + 1, random.randint(0,len(val_dataset.episodes)), val_dataset, global_rngs) # Visualize specific episode
         val_loss = val_loop(global_state, global_var, val_loader, global_rngs) # Compute full val loss
         
         val_losses.append(val_loss)
@@ -589,7 +740,7 @@ plt.savefig('train_val_loss.png')
 # plt.show()
 
 # Final Evaluation on Test Set
-visualize_episode(epoch + 1, 1, val_dataset, global_rngs)
+visualize_episode(epoch + 1, random.randint(0,len(test_dataset.episodes)), test_dataset, global_rngs)
 test_loss = val_loop(global_state, global_var, test_loader, global_rngs)
 print(f'Test Loss: {test_loss:.4f}')
 

@@ -354,7 +354,6 @@ def q_inverse_jax(q):
     xyz = q[..., 1:]
     return jnp.concatenate([w, -xyz], axis=-1)
 
-
 def q_multiply_jax(q1, q2):
     w1, x1, y1, z1 = jnp.split(q1, 4, axis=-1)
     w2, x2, y2, z2 = jnp.split(q2, 4, axis=-1)
@@ -365,7 +364,6 @@ def q_multiply_jax(q1, q2):
     z = w1*z2 + x1*y2 - y1*x2 + z1*w2
 
     return jnp.concatenate([w, x, y, z], axis=-1)
-
 
 def q_to_so3_jax(q):
     w = q[..., 0:1]
@@ -379,3 +377,14 @@ def q_to_so3_jax(q):
         angle / (norm_v + EPS),
     )
     return scale * v
+
+def quat_to_yaw_jax(q):
+    w = q[..., 0]
+    x = q[..., 1]
+    y = q[..., 2]
+    z = q[..., 3]
+    yaw = jnp.arctan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z)
+    )
+    return yaw

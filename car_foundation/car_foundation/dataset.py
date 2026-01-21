@@ -208,30 +208,85 @@ class MujocoDataset(Dataset):
         self.file_indices = [] # (start_idx, end_idx, file_path)
         self.total_windows = 0
 
-        # 병렬로 파일의 길이만 빠르게 체크
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # map returns iterator, cast to list to define order
-            results = list(tqdm.tqdm(executor.map(self._get_file_length, self.pickle_files), total=len(self.pickle_files)))
-
-        for file_path, length in zip(self.pickle_files, results):
-            if length == 0: continue # 너무 짧은 파일 스킵
-            
-            # 실제 사용 가능한 Window 수
-            num_windows = length - self.sequence_length + 1
-            if num_windows <= 0: continue
-
-            self.file_indices.append({
-                'file_path': file_path,
-                'raw_length': length,
-                'num_windows': num_windows,
-                'start_idx': self.total_windows,
-                'end_idx': self.total_windows + num_windows
-            })
-            self.total_windows += num_windows
+        self.episodes = [] # (T, E, Dim) 텐서들의 리스트
+        self.static_features = [] # (E, S) 텐서들의 리스트, episode 단위로 저장
+        self.window_indices = [] # (episode_idx, start_time) 튜플 리스트
         
-        if self.total_windows == 0:
-            raise ValueError("No valid data found (all episodes shorter than sequence length).")
+        # 병렬 로딩으로 속도 향상
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # 순서대로 로드하기 위해 map 사용
+            results = list(tqdm.tqdm(executor.map(self._load_file, self.pickle_files), total=len(self.pickle_files)))
+            loaded_data, self.static_features = map(list, zip(*results))
+            
+        for ep_idx, data_tensor in enumerate(loaded_data):
+            if data_tensor is None: continue
+            
+            # 유효한 윈도우 개수 계산
+            t_len = data_tensor.shape[0]
+            num_windows = t_len - self.sequence_length + 1
+            
+            if num_windows <= 0: continue
+            
+            self.episodes.append(data_tensor)
+            
+            self.file_indices.append({
+                'file_path': self.pickle_files[ep_idx],
+                'raw_length': len(data_tensor),
+                'num_windows': num_windows,
+                'start_idx': len(self.window_indices),
+                'end_idx': len(self.window_indices) + num_windows
+            })
 
+            # (Episode Index, Start Time) 매핑 정보 저장
+            # 이렇게 하면 __getitem__에서 O(1) 접근 가능
+            for t in range(num_windows):
+                self.window_indices.append((len(self.episodes)-1, t))
+            
+            
+                
+        print(f"Total Windows: {len(self.window_indices)}")
+
+        # # 병렬로 파일의 길이만 빠르게 체크
+        # with concurrent.futures.ThreadPoolExecutor() as executor:
+        #     # map returns iterator, cast to list to define order
+        #     results = list(tqdm.tqdm(executor.map(self._get_file_length, self.pickle_files), total=len(self.pickle_files)))
+
+        # for file_path, length in zip(self.pickle_files, results):
+        #     if length == 0: continue # 너무 짧은 파일 스킵
+            
+        #     # 실제 사용 가능한 Window 수
+        #     num_windows = length - self.sequence_length + 1
+        #     if num_windows <= 0: continue
+
+        #     self.file_indices.append({
+        #         'file_path': file_path,
+        #         'raw_length': length,
+        #         'num_windows': num_windows,
+        #         'start_idx': self.total_windows,
+        #         'end_idx': self.total_windows + num_windows
+        #     })
+        #     self.total_windows += num_windows
+        
+        # if self.total_windows == 0:
+        #     raise ValueError("No valid data found (all episodes shorter than sequence length).")
+
+    def _load_file(self, file_path):
+        """파일 하나를 읽어서 Tensor로 변환하여 리턴"""
+        try:
+            with open(file_path, 'rb') as f:
+                raw_data = pickle.load(f)
+            
+            # 전처리 (State + Action)
+            states = np.array(raw_data.data_logs['state'], dtype=np.float32)
+            actions = np.array(raw_data.data_logs['action'], dtype=np.float32)
+            static_features = np.array(raw_data.car_params['static_features'], dtype=np.float32) #(E, S)
+            
+            # (T, E, 13+6)
+            data = np.concatenate([states, actions], axis=-1)
+            return torch.tensor(data, dtype=torch.float32), torch.tensor(static_features, dtype=torch.float32)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return None
 
     def _get_file_length(self, file_path):
         """파일을 열어서 길이만 체크하고 닫음 (메타데이터 로드)"""
@@ -266,52 +321,59 @@ class MujocoDataset(Dataset):
         
         return torch.tensor(data_array, dtype=torch.float32), torch.tensor(static_features, dtype=torch.float32)
 
-
     def __len__(self):
-        return self.total_windows
+        return len(self.window_indices)
+        # return self.total_windows
     
     def __getitem__(self, idx):
         if isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
-            histories = []
-            static_features_list = []
-            action_seqs = []
-            ys = []
+            indices = range(*idx.indices(len(self)))
+            return [self[i] for i in indices]
+            # start, stop, step = idx.indices(len(self))
+            # histories = []
+            # static_features_list = []
+            # action_seqs = []
+            # ys = []
 
-            for i in range(start, stop, step):
-                h, s, a, y = self[i]   # ← int case 재사용
-                histories.append(h)
-                static_features_list.append(s)
-                action_seqs.append(a)
-                ys.append(y)
+            # for i in range(start, stop, step):
+            #     h, s, a, y = self[i]   # ← int case 재사용
+            #     histories.append(h)
+            #     static_features_list.append(s)
+            #     action_seqs.append(a)
+            #     ys.append(y)
 
-            return np.stack(histories), np.stack(static_features_list), np.stack(action_seqs), np.stack(ys),
+            # return np.stack(histories), np.stack(static_features_list), np.stack(action_seqs), np.stack(ys),
         
-        # 1. 어떤 파일의 어떤 윈도우인지 찾기 (Binary Search or Linear Scan)
-        # 파일 개수가 아주 많으면 bisect를 쓰는게 좋지만, 수천 개 정도면 linear도 빠름
-        # 여기서는 간단한 Linear Scan (최적화 가능)
-    
-        # --- idx는 int ---
-        target_file_info = None
-        for info in self.file_indices:
-            if info['start_idx'] <= idx < info['end_idx']:
-                target_file_info = info
-                break
+        # # 1. 어떤 파일의 어떤 윈도우인지 찾기 
+        # # --- idx는 int ---
+        # target_file_info = None
+        # for info in self.file_indices:
+        #     if info['start_idx'] <= idx < info['end_idx']:
+        #         target_file_info = info
+        #         break
         
-        if target_file_info is None:
-            raise IndexError(f"Index {idx} out of range")
+        # if target_file_info is None:
+        #     raise IndexError(f"Index {idx} out of range")
 
-        # 2. 로컬 인덱스 (파일 내에서 몇 번째 윈도우인가?)
-        window_idx = idx - target_file_info['start_idx']
+        # # 2. 로컬 인덱스 (파일 내에서 몇 번째 윈도우인가?)
+        # window_idx = idx - target_file_info['start_idx']
 
-        # 3. 파일 로드 (Cached)
-        # full data shape: (T_history, E, X+A)
-        # static_features shape: (E, S)
-        full_data, static_features = self._load_and_process_file(target_file_info['file_path'])
+        # # 3. 파일 로드 (Cached)
+        # # full data shape: (T_history, E, X+A)
+        # # static_features shape: (E, S)
+        # full_data, static_features = self._load_and_process_file(target_file_info['file_path'])
         
-        # 4. Lazy Slicing (핵심!)
-        # 전체 윈도우를 만들지 않고, 딱 필요한 부분만 잘라냅니다.
-        t_start = window_idx
+        # # 4. Lazy Slicing (핵심!)
+        # # 전체 윈도우를 만들지 않고, 딱 필요한 부분만 잘라냅니다.
+        # t_start = window_idx
+        # t_end = t_start + self.sequence_length
+
+        # 1. Direct Access (O(1))
+        ep_idx, t_start = self.window_indices[idx]
+        full_data = self.episodes[ep_idx]
+        static_features = self.static_features[ep_idx]
+
+        # 2. Slicing
         t_end = t_start + self.sequence_length
 
         # (1 + T_history + T_future, E, X+A)
@@ -376,12 +438,38 @@ class MujocoDataset(Dataset):
 
         return history, static_features, action_seq, y, current_state
     
-    def get_episode(self, idx):
+    def get_raw_data(self, idx):
+        # 1. 어떤 파일의 어떤 윈도우인지 찾기 (Binary Search or Linear Scan)
+        # 파일 개수가 아주 많으면 bisect를 쓰는게 좋지만, 수천 개 정도면 linear도 빠름
+        # 여기서는 간단한 Linear Scan (최적화 가능)
+    
+        # --- idx는 int ---
+        target_file_info = None
         for info in self.file_indices:
             if info['start_idx'] <= idx < info['end_idx']:
-                data, _ = self._load_and_process_file(info['file_path'])
-                return data
-        return None
+                target_file_info = info
+                break
+        
+        if target_file_info is None:
+            raise IndexError(f"Index {idx} out of range")
+
+        # 2. 로컬 인덱스 (파일 내에서 몇 번째 윈도우인가?)
+        window_idx = idx - target_file_info['start_idx']
+
+        # 3. 파일 로드 (Cached)
+        # full data shape: (T_history, E, X+A)
+        # static_features shape: (E, S)
+        full_data, static_features = self._load_and_process_file(target_file_info['file_path'])
+        
+        # 4. Lazy Slicing (핵심!)
+        # 전체 윈도우를 만들지 않고, 딱 필요한 부분만 잘라냅니다.
+        t_start = window_idx
+        t_end = t_start + self.sequence_length
+
+        # (1 + T_history + T_future, E, X+A)
+        # t-T_history, t-T_history+1, ...,t, t+T_future
+        data_window = full_data[t_start:t_end].clone()
+        return data_window
 
 class DynamicsPredictionMujocoDataset(Dataset):
     def __init__(self, path, history_length, action_length, 
